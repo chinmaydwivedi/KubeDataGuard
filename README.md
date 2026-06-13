@@ -13,6 +13,7 @@ What is implemented and verified:
 - Postgres -> Redpanda/Kafka -> OpenSearch demo pipeline.
 - Hardcoded commerce invariants for existence, aggregate consistency, and bounded freshness.
 - A first generic query invariant for Postgres source queries and OpenSearch JSON target queries.
+- Keyset-paginated Postgres source scans for query invariants, with source scan evidence in reports.
 - OpenSearch target query pagination with `search_after`; `size` is treated as page size, not a correctness cap.
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
 - Compact Kubernetes status handoff through ConfigMaps.
@@ -25,7 +26,7 @@ What is implemented and verified:
 What is intentionally not solved yet:
 
 - Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
-- Large-scale DBLog-style chunked, resumable source scans.
+- Full DBLog-style CDC watermarks, persisted checkpoints, and crash-resumable scan state.
 - Object-store lifecycle policy, retention, encryption, and report compaction.
 - Kubernetes Secret-backed connection loading from `DataSource` resources.
 - Production repair integrations such as Kafka replay, webhook dispatch, cache invalidation, and analytics backfill.
@@ -353,6 +354,7 @@ spec:
   checkIntervalSeconds: 300
   maxLagSeconds: 60
   keyField: id
+  sourceScanPageSize: 1000
   compareFields:
     - status
     - amount_cents
@@ -685,6 +687,7 @@ Current report shape:
 - `status`: compact control-plane phase such as `Healthy` or `DriftDetected`
 - `guarantee`: the semantic claim being checked
 - `observation_window`: check time, target read time, max lag, eligible source boundary, source LSN, stream topic, and stream offset range
+- `observation_window.source_scan`: keyset scan mode, key field, page size, page count, row count, first key, last key, and resume key
 - `kubernetes_status`: compact status payload used by the job-backed operator
 - `checkID`: generation or scheduled interval identifier used to make repeated checks idempotent
 - `counterexamples`: compact evidence for missing, stale, or aggregate-mismatch violations

@@ -3,14 +3,21 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable
 
-import psycopg
-from psycopg.rows import dict_row
-
 from .config import Settings
+
+DEFAULT_SOURCE_SCAN_PAGE_SIZE = 1000
+MAX_SOURCE_SCAN_PAGE_SIZE = 5000
+
+
+@dataclass(frozen=True)
+class QueryScanResult:
+    rows: list[dict[str, Any]]
+    evidence: dict[str, Any]
 
 
 SCHEMA_SQL = """
@@ -47,6 +54,9 @@ create index if not exists idx_order_events_outbox_order_id
 
 @contextmanager
 def connect(settings: Settings):
+    import psycopg
+    from psycopg.rows import dict_row
+
     with psycopg.connect(settings.postgres_dsn, row_factory=dict_row) as conn:
         yield conn
 
@@ -245,6 +255,112 @@ def execute_source_query(settings: Settings, query: str) -> list[dict[str, Any]]
             cur.execute(query)
             rows = cur.fetchall()
     return [serialize_query_row(row) for row in rows]
+
+
+def execute_source_query_keyset(
+    settings: Settings,
+    query: str,
+    *,
+    key_field: str,
+    page_size: int = DEFAULT_SOURCE_SCAN_PAGE_SIZE,
+    resume_after_key: Any | None = None,
+) -> QueryScanResult:
+    if not query.strip():
+        raise ValueError("source query is required")
+    page_size = bounded_source_scan_page_size(page_size)
+    source_query = normalized_source_query(query)
+    quoted_key = quote_identifier(key_field)
+
+    rows: list[dict[str, Any]] = []
+    pages = 0
+    last_key: Any | None = resume_after_key or None
+    first_key_text: str | None = None
+    last_key_text: str | None = str(resume_after_key) if resume_after_key else None
+
+    with connect(settings) as conn:
+        while True:
+            params: tuple[Any, ...]
+            if last_key is None:
+                paged_query = f"""
+                    select *
+                    from ({source_query}) as dataguard_source
+                    order by {quoted_key} asc
+                    limit %s
+                """
+                params = (page_size,)
+            else:
+                paged_query = f"""
+                    select *
+                    from ({source_query}) as dataguard_source
+                    where {quoted_key} > %s
+                    order by {quoted_key} asc
+                    limit %s
+                """
+                params = (last_key, page_size)
+
+            with conn.cursor() as cur:
+                cur.execute(paged_query, params)
+                page = cur.fetchall()
+
+            if not page:
+                break
+
+            pages += 1
+            for row in page:
+                if key_field not in row:
+                    raise ValueError(f"source query result is missing key field {key_field!r}")
+                raw_key = row[key_field]
+                raw_key_text = str(raw_key)
+                if first_key_text is None:
+                    first_key_text = raw_key_text
+                last_key = raw_key
+                last_key_text = raw_key_text
+                rows.append(serialize_query_row(row))
+
+            if len(page) < page_size:
+                break
+
+    return QueryScanResult(
+        rows=rows,
+        evidence={
+            "mode": "keyset",
+            "key_field": key_field,
+            "page_size": page_size,
+            "pages": pages,
+            "rows": len(rows),
+            "first_key": first_key_text,
+            "last_key": last_key_text,
+            "resume_after_key": str(resume_after_key) if resume_after_key else None,
+            "completed": True,
+        },
+    )
+
+
+def bounded_source_scan_page_size(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("source scan page size must be an integer") from exc
+    if parsed < 1:
+        raise ValueError("source scan page size must be at least 1")
+    return min(parsed, MAX_SOURCE_SCAN_PAGE_SIZE)
+
+
+def normalized_source_query(query: str) -> str:
+    normalized = query.strip().rstrip(";").strip()
+    if not normalized:
+        raise ValueError("source query is required")
+    return normalized
+
+
+def quote_identifier(identifier: str) -> str:
+    if not identifier:
+        raise ValueError("identifier cannot be empty")
+    if not all(char == "_" or char.isalnum() for char in identifier):
+        raise ValueError(f"unsupported identifier {identifier!r}; use a simple column alias")
+    if identifier[0].isdigit():
+        raise ValueError(f"unsupported identifier {identifier!r}; identifiers cannot start with a digit")
+    return '"' + identifier.replace('"', '""') + '"'
 
 
 def set_orders_updated_at(

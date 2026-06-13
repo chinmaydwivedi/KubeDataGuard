@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +14,7 @@ from dataguard.invariants import (
     summarize_paid_orders,
 )
 from dataguard.cli import build_repair_job_result
+from dataguard.db import execute_source_query_keyset
 from dataguard.local_demo import run_local_proof
 from dataguard.repair import repair_from_payload
 from dataguard.reporting import write_report_artifacts
@@ -316,6 +318,16 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
             key_field="id",
             compare_fields=["status", "amount_cents", "currency", "version"],
             guarantee="existence+fieldEquality",
+            source_scan={
+                "mode": "keyset",
+                "key_field": "id",
+                "page_size": 1,
+                "pages": 2,
+                "rows": 2,
+                "first_key": "order-1",
+                "last_key": "order-2",
+                "completed": True,
+            },
         )
 
         self.assertFalse(report.healthy)
@@ -324,6 +336,40 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(report.missing[0]["order_id"], "order-1")
         mismatch_fields = {item["field"] for item in report.stale[0]["mismatches"]}
         self.assertEqual(mismatch_fields, {"amount_cents", "version"})
+        self.assertEqual(
+            report.to_dict()["observation_window"]["source_scan"]["pages"],
+            2,
+        )
+        self.assertEqual(
+            report.kubernetes_status()["observationWindow"]["sourceScan"]["last_key"],
+            "order-2",
+        )
+
+    def test_query_results_can_mark_resumed_scan_partial(self):
+        report = compare_query_results(
+            invariant_name="paid-orders-query-check",
+            source_rows=[{"id": "order-2", "status": "paid"}],
+            target_rows=[{"id": "order-2", "status": "paid"}],
+            key_field="id",
+            compare_fields=["status"],
+            guarantee="existence+fieldEquality",
+            source_scan={
+                "mode": "keyset",
+                "key_field": "id",
+                "page_size": 1,
+                "pages": 1,
+                "rows": 1,
+                "resume_after_key": "order-1",
+                "completed": True,
+            },
+            check_status="partial",
+        )
+
+        payload = report.to_dict()
+        self.assertFalse(report.healthy)
+        self.assertEqual(payload["status"], "Unknown")
+        self.assertEqual(payload["check_status"], "partial")
+        self.assertEqual(payload["observation_window"]["completeness"], "partial")
 
     def test_local_proof_detects_repairs_and_verifies(self):
         result = run_local_proof(count=10, skip_every_paid=5)
@@ -504,6 +550,63 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertNotIn("search_after", fake_client.requests[0][1])
         self.assertEqual(fake_client.requests[1][1]["search_after"], ["order-1", "order-1"])
         self.assertIn("sort", fake_client.requests[0][1])
+
+    def test_execute_source_query_keyset_scans_in_pages(self):
+        settings = object()
+
+        class FakeCursor:
+            def __init__(self, conn):
+                self.conn = conn
+                self.page = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, query, params):
+                self.conn.queries.append((query, params))
+                self.page = self.conn.pages.pop(0)
+
+            def fetchall(self):
+                return self.page
+
+        class FakeConnection:
+            def __init__(self):
+                self.pages = [
+                    [{"id": "order-1", "status": "paid"}],
+                    [{"id": "order-2", "status": "paid"}],
+                    [],
+                ]
+                self.queries = []
+
+            def cursor(self):
+                return FakeCursor(self)
+
+        fake_conn = FakeConnection()
+
+        @contextmanager
+        def fake_connect(_settings):
+            yield fake_conn
+
+        with patch("dataguard.db.connect", fake_connect):
+            result = execute_source_query_keyset(
+                settings,
+                "select id, status from orders where status = 'paid'",
+                key_field="id",
+                page_size=1,
+            )
+
+        self.assertEqual([row["id"] for row in result.rows], ["order-1", "order-2"])
+        self.assertEqual(result.evidence["mode"], "keyset")
+        self.assertEqual(result.evidence["pages"], 2)
+        self.assertEqual(result.evidence["rows"], 2)
+        self.assertEqual(result.evidence["first_key"], "order-1")
+        self.assertEqual(result.evidence["last_key"], "order-2")
+        self.assertEqual(fake_conn.queries[0][1], (1,))
+        self.assertEqual(fake_conn.queries[1][1], ("order-1", 1))
+        self.assertIn("where \"id\" > %s", fake_conn.queries[1][0])
 
     def test_write_report_artifacts_defaults_to_local_file_refs(self):
         source = [

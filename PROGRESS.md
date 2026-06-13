@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique and now has optional S3/MinIO-compatible evidence storage.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, and has the first keyset-paginated source scan path.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
 
 ## Decisions Made
 
@@ -528,10 +528,77 @@ What remains intentionally open:
 
 ```text
 generic query support is currently Postgres -> OpenSearch only
-large scans still need DBLog-style chunking/watermarks/resume
+full DBLog-style watermarks, persisted checkpoints, and CDC/log-bound scan completion still need implementation
 object-store reports still need retention, encryption, lifecycle policy, and compaction
 DataSource connectionSecret is still not wired into Jobs
 production repair dispatch beyond local JSONL reconciliation events remains future work
+```
+
+## Latest Source Scan Pass
+
+Implemented the first response to the full-table-scan critique.
+
+What changed:
+
+- Added keyset-paginated Postgres source scans for generic `query` invariants.
+- The checker now wraps `sourceQuery` as a subquery, orders by declared `keyField`, and fetches pages using `sourceScanPageSize`.
+- Added CLI flags:
+  - `--source-scan-page-size`
+  - `--source-resume-after-key`
+- Added `spec.sourceScanPageSize` to the `Invariant` CRD.
+- Operator-created query checker Jobs now pass `--source-scan-page-size`.
+- Added source scan evidence into `observation_window.source_scan`:
+  - mode
+  - key field
+  - page size
+  - pages read
+  - rows read
+  - first key
+  - last key
+  - resume-after key
+  - completion marker
+- Added Markdown report rendering for source scan evidence.
+- Kept this explicitly narrower than DBLog: there is no persisted checkpoint store or source-log watermark reconciliation yet.
+
+What this fixes:
+
+```text
+Generic Postgres source checks no longer require one full fetchall() call.
+Reports can now prove how the source scan was chunked.
+The report contains a last_key that can be used as a resume boundary for manual or future automated continuation.
+```
+
+Verification for this source-scan pass:
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests
+  Passed: 22 tests
+
+python3 -m py_compile $(find src -name '*.py' | sort)
+  Passed
+
+go test ./...
+  Passed
+
+ruby YAML parse for Compose, CRDs, operator manifest, and examples
+  Passed
+
+docker compose build dataguard
+  Passed
+
+go build -o /tmp/dataguard-operator ./cmd/dataguard-operator
+  Passed
+
+docker compose run --rm dataguard check --invariant query --max-lag-seconds 0 --source-scan-page-size 10 ...
+  Passed: query invariant report included source_scan mode=keyset, page_size=10, pages=5, rows=41
+```
+
+What remains intentionally open:
+
+```text
+source scan checkpoints are not persisted across Jobs yet
+source snapshot watermarks are not tied to Kafka/CDC offsets yet
+parallel chunk scans and Merkle/checksum comparison are not implemented yet
 ```
 
 Runtime-verified:
@@ -878,7 +945,8 @@ Current answer:
 - Aggregate checks are now implemented for paid-order count and revenue total.
 - Lag-aware freshness is implemented for the commerce demo.
 - First generic Postgres/OpenSearch query invariant is implemented.
-- Next: DBLog-style chunked scans and Secret-backed `DataSource` resolution.
+- First keyset-paginated source scan path is implemented.
+- Next: persisted scan checkpoints, CDC watermarks, and Secret-backed `DataSource` resolution.
 
 ### Future
 

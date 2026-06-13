@@ -144,6 +144,23 @@ def markdown_report(payload: dict[str, Any]) -> str:
                 "",
             ]
         )
+        if observation_window.get("source_scan"):
+            source_scan = observation_window["source_scan"]
+            lines.extend(
+                [
+                    "## Source Scan",
+                    "",
+                    f"- Mode: `{source_scan.get('mode')}`",
+                    f"- Key field: `{source_scan.get('key_field')}`",
+                    f"- Page size: `{source_scan.get('page_size')}`",
+                    f"- Pages: `{source_scan.get('pages')}`",
+                    f"- Rows: `{source_scan.get('rows')}`",
+                    f"- First key: `{source_scan.get('first_key')}`",
+                    f"- Last key: `{source_scan.get('last_key')}`",
+                    f"- Resume after key: `{source_scan.get('resume_after_key')}`",
+                    "",
+                ]
+            )
 
     if payload.get("kubernetes_status"):
         lines.extend(["## Kubernetes Status Payload", "", "```json"])

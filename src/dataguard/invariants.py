@@ -23,6 +23,7 @@ class ObservationWindow:
     stream_topic: str | None = None
     stream_offset_start: int | None = None
     stream_offset_end: int | None = None
+    source_scan: dict[str, Any] | None = None
     completeness: str = CHECK_COMPLETE
 
     def to_dict(self) -> dict[str, Any]:
@@ -36,6 +37,7 @@ class ObservationWindow:
             "stream_topic": self.stream_topic,
             "stream_offset_start": self.stream_offset_start,
             "stream_offset_end": self.stream_offset_end,
+            "source_scan": self.source_scan,
             "completeness": self.completeness,
         }
 
@@ -280,6 +282,8 @@ def compare_query_results(
     stream_offset_start: int | None = None,
     stream_offset_end: int | None = None,
     source_lsn: str | None = None,
+    source_scan: dict[str, Any] | None = None,
+    check_status: str = CHECK_COMPLETE,
 ) -> DriftReport:
     target_by_key = {
         str(row[key_field]): row
@@ -338,6 +342,7 @@ def compare_query_results(
         missing=missing,
         stale=stale,
         guarantee=guarantee,
+        check_status=check_status,
         observation_window=build_observation_window(
             source_rows,
             max_lag_seconds=max_lag_seconds,
@@ -348,6 +353,8 @@ def compare_query_results(
             stream_offset_end=stream_offset_end,
             source_watermark=latest_source_watermark(source_rows),
             source_lsn=source_lsn,
+            source_scan=source_scan,
+            completeness=check_status,
         ),
     )
 
@@ -541,6 +548,8 @@ def build_observation_window(
     stream_offset_end: int | None = None,
     source_watermark: str | None = None,
     source_lsn: str | None = None,
+    source_scan: dict[str, Any] | None = None,
+    completeness: str = CHECK_COMPLETE,
 ) -> ObservationWindow:
     checked_at = checked_at or datetime.now(timezone.utc)
     target_read_at = target_read_at or datetime.now(timezone.utc)
@@ -558,6 +567,8 @@ def build_observation_window(
         stream_topic=stream_topic,
         stream_offset_start=stream_offset_start,
         stream_offset_end=stream_offset_end,
+        source_scan=source_scan,
+        completeness=completeness,
     )
 
 
@@ -596,6 +607,7 @@ def kubernetes_observation_window(window: dict[str, Any] | None) -> dict[str, An
         "streamTopic": window.get("stream_topic"),
         "streamOffsetStart": window.get("stream_offset_start"),
         "streamOffsetEnd": window.get("stream_offset_end"),
+        "sourceScan": window.get("source_scan"),
         "completeness": window.get("completeness"),
     }
     return {key: value for key, value in payload.items() if value is not None}

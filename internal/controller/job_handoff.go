@@ -749,6 +749,7 @@ func appendQueryArgs(args []string, invariant *unstructured.Unstructured) []stri
 		return args
 	}
 	args = append(args, "--key-field", keyField(invariant))
+	args = append(args, "--source-scan-page-size", strconv.FormatInt(sourceScanPageSize(invariant), 10))
 	if fields := compareFields(invariant); fields != "" {
 		args = append(args, "--compare-fields", fields)
 	}
@@ -825,6 +826,17 @@ func compareFields(invariant *unstructured.Unstructured) string {
 		return ""
 	}
 	return strings.Join(values, ",")
+}
+
+func sourceScanPageSize(invariant *unstructured.Unstructured) int64 {
+	value, found, _ := unstructured.NestedInt64(invariant.Object, "spec", "sourceScanPageSize")
+	if !found || value <= 0 {
+		return 1000
+	}
+	if value > 5000 {
+		return 5000
+	}
+	return value
 }
 
 func currentCheckRun(invariant *unstructured.Unstructured, now time.Time) (CheckRun, error) {

@@ -221,6 +221,7 @@ func TestBuildCheckerJobPassesQueryInvariantConfigurationToWorker(t *testing.T) 
 	spec["sourceQuery"] = "select id, status from orders where status = 'paid'"
 	spec["targetQuery"] = `{"query":{"term":{"status":"paid"}}}`
 	spec["keyField"] = "id"
+	spec["sourceScanPageSize"] = int64(250)
 	spec["compareFields"] = []any{"status", "version"}
 
 	job, err := BuildCheckerJob(invariant, CheckRun{ID: "g3"})
@@ -238,6 +239,8 @@ func TestBuildCheckerJobPassesQueryInvariantConfigurationToWorker(t *testing.T) 
 		`{"query":{"term":{"status":"paid"}}}`,
 		"--key-field",
 		"id",
+		"--source-scan-page-size",
+		"250",
 		"--compare-fields",
 		"status,version",
 	} {

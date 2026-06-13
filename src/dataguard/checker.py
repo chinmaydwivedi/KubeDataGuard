@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from . import db, search
 from .config import Settings
 from .invariants import (
+    CHECK_COMPLETE,
     DriftReport,
     compare_paid_order_aggregates,
     compare_paid_order_freshness,
@@ -96,11 +97,19 @@ def check_query_invariant(
     key_field: str,
     compare_fields: list[str],
     max_lag_seconds: int,
+    source_scan_page_size: int = db.DEFAULT_SOURCE_SCAN_PAGE_SIZE,
+    source_resume_after_key: str | None = None,
 ) -> DriftReport:
     checked_at = datetime.now(timezone.utc)
     offsets = stream_offsets(settings)
     source_lsn = db.current_wal_lsn(settings)
-    source_rows = db.execute_source_query(settings, source_query)
+    source_scan = db.execute_source_query_keyset(
+        settings,
+        source_query,
+        key_field=key_field,
+        page_size=source_scan_page_size,
+        resume_after_key=source_resume_after_key,
+    )
     target_rows = search.execute_target_query(
         settings,
         target_query,
@@ -109,9 +118,10 @@ def check_query_invariant(
     guarantee = "existence"
     if compare_fields:
         guarantee = "existence+fieldEquality"
+    check_status = CHECK_COMPLETE if not source_resume_after_key else "partial"
     return compare_query_results(
         invariant_name=invariant_name,
-        source_rows=source_rows,
+        source_rows=source_scan.rows,
         target_rows=target_rows,
         key_field=key_field,
         compare_fields=compare_fields,
@@ -123,6 +133,8 @@ def check_query_invariant(
         stream_offset_start=offsets["stream_offset_start"],
         stream_offset_end=offsets["stream_offset_end"],
         source_lsn=source_lsn,
+        source_scan=source_scan.evidence,
+        check_status=check_status,
     )
 
 

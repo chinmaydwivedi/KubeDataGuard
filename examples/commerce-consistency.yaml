@@ -104,6 +104,7 @@ spec:
   checkIntervalSeconds: 300
   maxLagSeconds: 60
   keyField: id
+  sourceScanPageSize: 25
   compareFields:
     - status
     - amount_cents

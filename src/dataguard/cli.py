@@ -242,6 +242,8 @@ def run_check(settings: Settings, args: argparse.Namespace):
         target_query=getattr(args, "target_query", None),
         key_field=getattr(args, "key_field", "id"),
         compare_fields=parse_compare_fields(getattr(args, "compare_fields", "")),
+        source_scan_page_size=getattr(args, "source_scan_page_size", 1000),
+        source_resume_after_key=getattr(args, "source_resume_after_key", ""),
     )
 
     payload = report.to_dict()
@@ -268,6 +270,8 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
         target_query=args.target_query,
         key_field=args.key_field,
         compare_fields=parse_compare_fields(args.compare_fields),
+        source_scan_page_size=args.source_scan_page_size,
+        source_resume_after_key=args.source_resume_after_key,
     )
 
     payload = report.to_dict()
@@ -305,6 +309,8 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
             target_query=args.target_query,
             key_field=args.key_field,
             compare_fields=parse_compare_fields(args.compare_fields),
+            source_scan_page_size=args.source_scan_page_size,
+            source_resume_after_key=args.source_resume_after_key,
         )
         print("post-repair verification:")
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -333,6 +339,8 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
         target_query=args.target_query,
         key_field=args.key_field,
         compare_fields=parse_compare_fields(args.compare_fields),
+        source_scan_page_size=args.source_scan_page_size,
+        source_resume_after_key=args.source_resume_after_key,
     )
 
     verification_payload = verification.to_dict()
@@ -362,6 +370,8 @@ def add_query_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-query", default="")
     parser.add_argument("--key-field", default="id")
     parser.add_argument("--compare-fields", default="")
+    parser.add_argument("--source-scan-page-size", type=int, default=1000)
+    parser.add_argument("--source-resume-after-key", default="")
 
 
 def parse_compare_fields(raw: str) -> list[str]:
@@ -379,6 +389,8 @@ def check_invariant(
     target_query: str | None = None,
     key_field: str = "id",
     compare_fields: list[str] | None = None,
+    source_scan_page_size: int = 1000,
+    source_resume_after_key: str = "",
 ):
     if invariant == "existence":
         return checker.check_paid_orders_indexed(
@@ -408,6 +420,8 @@ def check_invariant(
             key_field=key_field,
             compare_fields=compare_fields or [],
             max_lag_seconds=max_lag_seconds,
+            source_scan_page_size=source_scan_page_size,
+            source_resume_after_key=source_resume_after_key or None,
         )
     raise SystemExit(f"unknown invariant: {invariant}")
 

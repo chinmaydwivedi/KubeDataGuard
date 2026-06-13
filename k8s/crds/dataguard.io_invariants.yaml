@@ -56,6 +56,11 @@ spec:
                 keyField:
                   type: string
                   default: id
+                sourceScanPageSize:
+                  type: integer
+                  minimum: 1
+                  maximum: 5000
+                  default: 1000
                 compareFields:
                   type: array
                   items:
@@ -108,6 +113,9 @@ spec:
                       type: integer
                     streamOffsetEnd:
                       type: integer
+                    sourceScan:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                     completeness:
                       type: string
                 counterexampleCount:

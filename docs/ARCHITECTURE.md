@@ -338,12 +338,13 @@ The first generic query path is intentionally scoped:
 
 ```text
 Postgres sourceQuery
+keyset-paginated source scan by keyField
 OpenSearch JSON targetQuery
 keyField join
 optional compareFields equality
 ```
 
-The older commerce checks remain as optimized hardcoded demo invariants. The `query` invariant type is the first step toward making `sourceQuery` and `targetQuery` executable API fields rather than documentation-only fields.
+The older commerce checks remain as optimized hardcoded demo invariants. The `query` invariant type is the first step toward making `sourceQuery` and `targetQuery` executable API fields rather than documentation-only fields. Source scans now wrap the declared query as a subquery, order by `keyField`, and fetch pages with `sourceScanPageSize`; this is the first chunking step before full DBLog-style persisted checkpoints and CDC watermarks.
 
 The job-backed path is enabled with:
 
