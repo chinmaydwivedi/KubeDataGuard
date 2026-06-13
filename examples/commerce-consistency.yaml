@@ -83,12 +83,12 @@ spec:
 apiVersion: dataguard.io/v1alpha1
 kind: RepairPolicy
 metadata:
-  name: reindex-missing-paid-orders
+  name: reconcile-missing-paid-orders
 spec:
   invariantRef: paid-orders-indexed
-  approvalRequired: false
+  approvalRequired: true
   actions:
-    - type: reindex-records
+    - type: emit-reconcile-events
       batchSize: 500
 ---
 apiVersion: dataguard.io/v1alpha1
@@ -117,7 +117,6 @@ spec:
     order by updated_at asc, id asc
   targetQuery: |
     {
-      "size": 10000,
       "query": {
         "bool": {
           "filter": [
@@ -131,10 +130,10 @@ spec:
 apiVersion: dataguard.io/v1alpha1
 kind: RepairPolicy
 metadata:
-  name: reindex-stale-paid-orders
+  name: reconcile-stale-paid-orders
 spec:
   invariantRef: paid-orders-freshness
-  approvalRequired: false
+  approvalRequired: true
   actions:
-    - type: reindex-records
+    - type: emit-reconcile-events
       batchSize: 500

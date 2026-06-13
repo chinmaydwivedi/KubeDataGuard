@@ -1,5 +1,7 @@
 import unittest
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -13,6 +15,7 @@ from dataguard.invariants import (
 from dataguard.cli import build_repair_job_result
 from dataguard.local_demo import run_local_proof
 from dataguard.repair import repair_from_payload
+from dataguard.search import execute_target_query
 
 
 class PaidOrdersIndexedInvariantTests(unittest.TestCase):
@@ -395,6 +398,30 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(result["candidate_order_ids"], ["order-3"])
         self.assertEqual(result["repaired"], 1)
 
+    def test_repair_from_payload_can_emit_reconcile_events_without_direct_writes(self):
+        payload = {
+            "missing": [{"order_id": "order-1"}],
+            "stale": [{"order_id": "order-2"}],
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            settings = SimpleNamespace(report_dir=Path(tmpdir))
+            result = repair_from_payload(
+                settings,
+                payload,
+                mode="emit-reconcile-events",
+                verbose=False,
+            )
+
+            event_path = Path(result["eventRef"].removeprefix("file://"))
+            events = event_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result["candidate_order_ids"], ["order-1", "order-2"])
+        self.assertEqual(result["repair_mode"], "emit-reconcile-events")
+        self.assertEqual(result["emitted"], 2)
+        self.assertEqual(len(events), 2)
+        self.assertIn('"action": "reconcile"', events[0])
+
     def test_repair_job_result_marks_failed_when_verification_still_drifts(self):
         verification = compare_paid_orders_to_index(
             [
@@ -414,6 +441,7 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
             source_report_ref="configmap://default/source/report.json",
             repair_report_ref="configmap://default/repair/report.json",
             repair_result={"repaired": 0, "candidate_order_ids": ["order-1"]},
+            repair_action="direct-reindex",
             verification=verification,
             observed_generation=9,
         )
@@ -425,6 +453,56 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(status["observedGeneration"], 9)
         self.assertEqual(payload["status"], "RepairFailed")
         self.assertEqual(payload["verification"]["status"], "DriftDetected")
+
+    def test_execute_target_query_paginates_past_requested_size(self):
+        settings = SimpleNamespace(orders_index="orders")
+
+        class FakeOpenSearch:
+            def __init__(self):
+                self.requests = []
+
+            def search(self, *, index, body):
+                self.requests.append((index, body))
+                if len(self.requests) == 1:
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_id": "order-1",
+                                    "_source": {"status": "paid"},
+                                    "sort": ["order-1", "order-1"],
+                                }
+                            ]
+                        }
+                    }
+                if len(self.requests) == 2:
+                    return {
+                        "hits": {
+                            "hits": [
+                                {
+                                    "_id": "order-2",
+                                    "_source": {"id": "order-2", "status": "paid"},
+                                    "sort": ["order-2", "order-2"],
+                                }
+                            ]
+                        }
+                    }
+                return {"hits": {"hits": []}}
+
+        fake_client = FakeOpenSearch()
+        with patch("dataguard.search.client", return_value=fake_client):
+            rows = execute_target_query(
+                settings,
+                '{"query":{"match_all":{}},"size":1}',
+                key_field="id",
+            )
+
+        self.assertEqual([row["id"] for row in rows], ["order-1", "order-2"])
+        self.assertEqual(len(fake_client.requests), 3)
+        self.assertEqual(fake_client.requests[0][0], "orders")
+        self.assertNotIn("search_after", fake_client.requests[0][1])
+        self.assertEqual(fake_client.requests[1][1]["search_after"], ["order-1", "order-1"])
+        self.assertIn("sort", fake_client.requests[0][1])
 
     def test_repair_job_result_stays_healthy_when_verification_passes(self):
         source = [
@@ -443,6 +521,7 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
             source_report_ref="configmap://default/source/report.json",
             repair_report_ref="configmap://default/repair/report.json",
             repair_result={"repaired": 1, "candidate_order_ids": ["order-1"]},
+            repair_action="direct-reindex",
             verification=verification,
             observed_generation=10,
         )

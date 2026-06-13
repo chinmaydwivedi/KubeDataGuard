@@ -73,7 +73,7 @@ The controller supports two modes:
 
 In job-backed mode, the operator creates Kubernetes Jobs for each `Invariant` generation or scheduled `checkIntervalSeconds` slot. The Job runs the Python checker, writes the full report to the worker report store, writes compact `status.json` and `repair-input.json` into a ConfigMap, and the operator patches `Invariant.status` from `status.json`.
 
-If that status is `DriftDetected` and an auto-approved `RepairPolicy` exists, the operator creates a repair Job for the same check ID. The repair Job reads compact repair input from the checker ConfigMap, reindexes missing/stale records from Postgres into OpenSearch, verifies the invariant, writes a repair status ConfigMap, and the operator patches `Invariant.status` from the repair result.
+If that status is `DriftDetected` and an explicitly allowed `RepairPolicy` exists, the operator creates a repair Job for the same check ID. The direct-reindex path is fenced behind the unsafe opt-in annotation; the safer direction is to emit reconciliation requests that the owning service or pipeline executes. The repair Job verifies the invariant, writes a repair status ConfigMap, and the operator patches `Invariant.status` from the repair result.
 
 Build and run the operator in-cluster:
 

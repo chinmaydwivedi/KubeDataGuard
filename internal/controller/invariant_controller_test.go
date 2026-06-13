@@ -227,18 +227,29 @@ func TestBuildCheckerJobPassesQueryInvariantConfigurationToWorker(t *testing.T) 
 	}
 }
 
-func TestRepairPolicyAllowsAutoReindexOnlyWithoutApproval(t *testing.T) {
+func TestRepairPolicyAllowsAutoReindexRequiresExplicitUnsafeOptIn(t *testing.T) {
 	policy := repairPolicyObject("paid-orders-indexed", false, "reindex-records")
 
 	allowed, err := repairPolicyAllowsAutoReindex(policy)
 	if err != nil {
 		t.Fatalf("repairPolicyAllowsAutoReindex returned error: %v", err)
 	}
+	if allowed {
+		t.Fatal("repairPolicyAllowsAutoReindex = true without unsafe annotation, want false")
+	}
+
+	annotated := repairPolicyObject("paid-orders-indexed", false, "reindex-records")
+	annotated.SetAnnotations(map[string]string{AnnotationAllowUnsafeReindex: "true"})
+	allowed, err = repairPolicyAllowsAutoReindex(annotated)
+	if err != nil {
+		t.Fatalf("repairPolicyAllowsAutoReindex returned error: %v", err)
+	}
 	if !allowed {
-		t.Fatal("repairPolicyAllowsAutoReindex = false, want true")
+		t.Fatal("repairPolicyAllowsAutoReindex = false with unsafe annotation, want true")
 	}
 
 	approvalRequired := repairPolicyObject("paid-orders-indexed", true, "reindex-records")
+	approvalRequired.SetAnnotations(map[string]string{AnnotationAllowUnsafeReindex: "true"})
 	allowed, err = repairPolicyAllowsAutoReindex(approvalRequired)
 	if err != nil {
 		t.Fatalf("repairPolicyAllowsAutoReindex returned error: %v", err)
@@ -374,6 +385,17 @@ func TestReportStatusAlreadyAppliedComparesControllerStatusIdentity(t *testing.T
 		t.Fatal("reportStatusAlreadyApplied = false, want true")
 	}
 
+	telemetryOnly := map[string]any{}
+	for key, value := range status {
+		telemetryOnly[key] = value
+	}
+	telemetryOnly["checkedRecords"] = int64(42)
+	telemetryOnly["reportRef"] = "file:///tmp/report-next.json"
+	telemetryOnly["checkID"] = "g3-t99"
+	if !reportStatusAlreadyApplied(invariant, telemetryOnly) {
+		t.Fatal("reportStatusAlreadyApplied = false for telemetry-only changes, want true")
+	}
+
 	changed := map[string]any{}
 	for key, value := range status {
 		changed[key] = value
@@ -381,6 +403,27 @@ func TestReportStatusAlreadyAppliedComparesControllerStatusIdentity(t *testing.T
 	changed["driftCount"] = int64(9)
 	if reportStatusAlreadyApplied(invariant, changed) {
 		t.Fatal("reportStatusAlreadyApplied = true after driftCount changed, want false")
+	}
+}
+
+func TestShouldPatchCheckerRunningStatusDoesNotChurnSettledHealth(t *testing.T) {
+	invariant := invariantObject("paid-orders-indexed", "existence", nil)
+	if !shouldPatchCheckerRunningStatus(invariant) {
+		t.Fatal("shouldPatchCheckerRunningStatus = false without current status, want true")
+	}
+
+	if err := unstructured.SetNestedMap(invariant.Object, map[string]any{"phase": PhaseHealthy}, "status"); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+	if shouldPatchCheckerRunningStatus(invariant) {
+		t.Fatal("shouldPatchCheckerRunningStatus = true for Healthy, want false")
+	}
+
+	if err := unstructured.SetNestedMap(invariant.Object, map[string]any{"phase": PhaseCheckFailed}, "status"); err != nil {
+		t.Fatalf("set status: %v", err)
+	}
+	if !shouldPatchCheckerRunningStatus(invariant) {
+		t.Fatal("shouldPatchCheckerRunningStatus = false for CheckFailed, want true")
 	}
 }
 

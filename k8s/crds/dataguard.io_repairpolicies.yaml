@@ -39,9 +39,11 @@ spec:
                     properties:
                       type:
                         type: string
-                        enum: ["reindex-records", "replay-kafka", "invalidate-cache", "run-job"]
+                        enum: ["emit-reconcile-events", "call-webhook", "reindex-records", "replay-kafka", "invalidate-cache", "run-job"]
                       batchSize:
                         type: integer
+                      endpoint:
+                        type: string
                       topic:
                         type: string
                       jobTemplateRef:
@@ -49,4 +51,3 @@ spec:
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
-

@@ -146,10 +146,10 @@ operator check-job path
 operator repair-job path
   |
   |-- observe DriftDetected checker report
-  |-- find auto-approved RepairPolicy
+  |-- find explicitly allowed RepairPolicy
   |-- create one repair Job per Invariant generation
   |-- read checker repair-input ConfigMap
-  |-- reindex missing/stale records from Postgres
+  |-- emit reconciliation requests or direct-reindex in unsafe demo mode
   |-- verify the invariant
   |-- write repair status.json and compact repair input into a ConfigMap
   |-- patch Invariant.status from repair status.json
@@ -258,16 +258,24 @@ counterexamples
 repair_scope
 ```
 
-## Repair Logic
+## Reconciliation Logic
 
-The first repair is source-of-truth reindexing:
+The safe production model is owner-executed reconciliation:
+
+```text
+missing/stale order ids -> emit reconcile request -> owning service/pipeline transforms and writes the derived view
+```
+
+That keeps business transformation logic in the system that owns it. KubeDataGuard should provide evidence and trigger a reconciliation workflow; it should not normally bypass the pipeline and write raw source rows into a derived store.
+
+The local demo still supports source-of-truth reindexing:
 
 ```text
 missing/stale order ids -> fetch from Postgres -> write to OpenSearch
 freshness violation order ids -> fetch from Postgres -> write to OpenSearch
 ```
 
-This avoids trusting the event stream during repair. Later versions can repair by replaying Kafka offsets or rebuilding whole partitions.
+Direct reindexing is useful for a controlled vertical-slice proof, but the operator fences automatic direct reindex behind `approvalRequired: false` and `dataguard.io/allow-unsafe-direct-reindex: "true"`. Later versions should dispatch reconciliation events, call owner webhooks, replay Kafka offsets, or rebuild whole partitions.
 
 ## Kubernetes Control Plane
 
@@ -277,7 +285,7 @@ The local commands map directly to operator reconciliation:
 DataSource    -> Postgres connection
 DerivedView   -> OpenSearch index derived through Redpanda
 Invariant     -> paid-orders-indexed rule
-RepairPolicy  -> reindex missing/stale orders
+RepairPolicy  -> emit reconciliation requests or explicitly approved repair
 ```
 
 The controller loop now performs the first closed-loop version of what the CLI proved:
@@ -286,11 +294,11 @@ The controller loop now performs the first closed-loop version of what the CLI p
 observe desired invariant
 measure actual state
 write status
-repair if policy allows
+trigger reconciliation if policy allows
 verify
 ```
 
-The first repair strategy is implemented for `reindex-records`. Later repair strategies should cover Kafka replay, Redis invalidation, and analytics backfill.
+The first direct repair strategy is implemented for `reindex-records`, but automatic direct writes are unsafe by default. The safer worker path can emit reconciliation-event JSONL, and later integrations should publish those events to Kafka/webhooks, invalidate Redis, or trigger analytics backfill.
 
 ## Current Closed-Loop Operator
 
@@ -302,11 +310,11 @@ Invariant CRD
   |-- deterministic checker Job for this generation/checkID
   |-- Python checker runs against Postgres/Redpanda/OpenSearch
   |-- report ConfigMap stores status.json and repair-input.json
-  |-- DriftDetected status selects a RepairPolicy
+  |-- DriftDetected status selects an explicitly allowed RepairPolicy
   |-- deterministic repair Job reads the checker report
-  |-- Python repair reindexes and verifies
+  |-- Python repair emits reconciliation events or direct-reindexes in unsafe demo mode
   |-- repair ConfigMap stores status.json and repair-input.json
-  |-- status subresource patch copies checker or repair status.json into Invariant.status
+  |-- status subresource patch copies semantic checker or repair status into Invariant.status
   |
 Invariant.status
 ```

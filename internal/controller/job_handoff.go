@@ -31,6 +31,7 @@ const (
 	AnnotationOpenSearchURL         = "dataguard.io/opensearch-url"
 	AnnotationOrdersIndex           = "dataguard.io/orders-index"
 	AnnotationOrderEventsTopic      = "dataguard.io/order-events-topic"
+	AnnotationAllowUnsafeReindex    = "dataguard.io/allow-unsafe-direct-reindex"
 
 	CheckPartial = "partial"
 	CheckFailed  = "failed"
@@ -51,7 +52,7 @@ type CheckRun struct {
 	ID              string
 	IntervalSeconds int64
 	NextRequeue     time.Duration
-	Scheduled        bool
+	Scheduled       bool
 }
 
 func (r *InvariantReconciler) reconcileJobBackedInvariant(
@@ -131,8 +132,11 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 		if err := r.Create(ctx, job); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.patchInvariantStatus(ctx, invariant, BuildJobRunningStatus(invariant, r.clock().Now(), jobName, run)); err != nil {
-			return ctrl.Result{}, err
+		runningStatus := BuildJobRunningStatus(invariant, r.clock().Now(), jobName, run)
+		if shouldPatchCheckerRunningStatus(invariant) {
+			if err := r.patchInvariantStatus(ctx, invariant, runningStatus); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 		log.Info(
 			"created checker job for invariant",
@@ -162,8 +166,10 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 		return requeueForRun(run), nil
 	}
 
-	if err := r.patchInvariantStatus(ctx, invariant, BuildJobRunningStatus(invariant, r.clock().Now(), jobName, run)); err != nil {
-		return ctrl.Result{}, err
+	if shouldPatchCheckerRunningStatus(invariant) {
+		if err := r.patchInvariantStatus(ctx, invariant, BuildJobRunningStatus(invariant, r.clock().Now(), jobName, run)); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
@@ -318,6 +324,9 @@ func repairPolicyAllowsAutoReindex(policy *unstructured.Unstructured) (bool, err
 	if found && approvalRequired {
 		return false, nil
 	}
+	if policy.GetAnnotations()[AnnotationAllowUnsafeReindex] != "true" {
+		return false, nil
+	}
 
 	actions, found, err := unstructured.NestedSlice(policy.Object, "spec", "actions")
 	if err != nil {
@@ -385,7 +394,7 @@ func BuildCheckerJob(invariant *unstructured.Unstructured, run CheckRun) (*batch
 							Image:           annotationOrDefault(invariant, AnnotationCheckerImage, DefaultCheckerImage),
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Args:            args,
-							Env: checkerEnv(invariant),
+							Env:             checkerEnv(invariant),
 						},
 					},
 				},
@@ -413,6 +422,7 @@ func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapN
 		"--invariant-name", invariant.GetName(),
 		"--observed-generation", strconv.FormatInt(invariant.GetGeneration(), 10),
 		"--check-id", run.ID,
+		"--repair-mode", "direct-reindex",
 		"--max-lag-seconds", strconv.FormatInt(maxLagSeconds, 10),
 		"--verify-invariant", checkerInvariantArg(invariant),
 	}
@@ -441,7 +451,7 @@ func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapN
 							Image:           repairImage(invariant),
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Args:            args,
-							Env: checkerEnv(invariant),
+							Env:             checkerEnv(invariant),
 						},
 					},
 				},
@@ -662,7 +672,6 @@ func reportStatusAlreadyApplied(invariant *unstructured.Unstructured, desired ma
 	for _, key := range []string{
 		"driftCount",
 		"counterexampleCount",
-		"checkedRecords",
 		"observedGeneration",
 		"checkIntervalSeconds",
 	} {
@@ -673,7 +682,7 @@ func reportStatusAlreadyApplied(invariant *unstructured.Unstructured, desired ma
 		}
 	}
 
-	for _, key := range []string{"phase", "checkStatus", "guarantee", "reportRef", "checkID"} {
+	for _, key := range []string{"phase", "checkStatus", "guarantee", "reason", "repairAction"} {
 		currentValue, currentOK := stringField(current, key)
 		desiredValue, desiredOK := stringField(desired, key)
 		if currentOK != desiredOK || currentValue != desiredValue {
@@ -684,6 +693,18 @@ func reportStatusAlreadyApplied(invariant *unstructured.Unstructured, desired ma
 	currentHealthy, currentOK := boolField(current, "healthy")
 	desiredHealthy, desiredOK := boolField(desired, "healthy")
 	return currentOK == desiredOK && currentHealthy == desiredHealthy
+}
+
+func shouldPatchCheckerRunningStatus(invariant *unstructured.Unstructured) bool {
+	current, found, err := unstructured.NestedMap(invariant.Object, "status")
+	if err != nil || !found {
+		return true
+	}
+	phase, ok := stringField(current, "phase")
+	if !ok {
+		return true
+	}
+	return phase != PhaseHealthy && phase != PhaseDriftDetected
 }
 
 func checkerEnv(invariant *unstructured.Unstructured) []corev1.EnvVar {
@@ -814,7 +835,7 @@ func currentCheckRun(invariant *unstructured.Unstructured, now time.Time) (Check
 		ID:              fmt.Sprintf("g%d-t%d", invariant.GetGeneration(), slot),
 		IntervalSeconds: intervalSeconds,
 		NextRequeue:     next,
-		Scheduled:        true,
+		Scheduled:       true,
 	}, nil
 }
 

@@ -2,29 +2,54 @@
 
 ## One-Line Idea
 
-KubeDataGuard is a Kubernetes-native data consistency SLO operator for checking, explaining, and repairing drift between source-of-truth systems and derived data stores.
+KubeDataGuard is an evidence-first data consistency SLO engine with an optional Kubernetes operator for scheduling checks, publishing compact status, and triggering safe reconciliation workflows.
 
 ## Current Maturity
 
-This repository is a research-grade vertical-slice MVP, not a production-ready general-purpose data platform yet.
+This repository is a research prototype vertical-slice MVP, not a production-ready general-purpose data platform yet.
 
 What is implemented and verified:
 
 - Postgres -> Redpanda/Kafka -> OpenSearch demo pipeline.
 - Hardcoded commerce invariants for existence, aggregate consistency, and bounded freshness.
 - A first generic query invariant for Postgres source queries and OpenSearch JSON target queries.
+- OpenSearch target query pagination with `search_after`; `size` is treated as page size, not a correctness cap.
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
 - Compact Kubernetes status handoff through ConfigMaps.
 - Full JSON/Markdown reports written to the worker report store and referenced from status.
-- Source-of-truth reindex repair for missing/stale/freshness drift in the commerce demo.
+- Direct source-of-truth reindex repair for explicit local demos.
+- Safer reconciliation-event repair mode for owner-executed remediation.
+- Operator safeguards that avoid status churn for repeated healthy scheduled checks.
 
 What is intentionally not solved yet:
 
 - Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
-- Large-scale DBLog-style chunked, resumable scans.
+- Large-scale DBLog-style chunked, resumable source scans.
 - Production object-store report persistence such as S3/GCS/MinIO.
 - Kubernetes Secret-backed connection loading from `DataSource` resources.
-- General repair strategies such as Kafka replay, cache invalidation, and analytics backfill.
+- Production repair integrations such as Kafka replay, webhook dispatch, cache invalidation, and analytics backfill.
+
+## Architectural Boundary
+
+The first-principles rule is:
+
+```text
+Kubernetes is the control plane, not the data plane.
+```
+
+KubeDataGuard should use Kubernetes to declare invariants, schedule workers, expose compact semantic status, and connect to normal platform alerting. It should not use `etcd`, CRD status, or ConfigMaps as a high-volume row-level data store.
+
+The long-term shape is:
+
+```text
+Invariant CRD / CLI config
+  -> checker worker
+  -> durable report store such as S3, GCS, or MinIO
+  -> compact health metric/status only
+  -> owner-approved reconciliation request
+```
+
+That boundary matters because a real drift report can contain thousands or millions of counterexamples. Kubernetes should hold the pointer and the phase, not the blob. The checked-in operator already keeps ConfigMaps compact and avoids rewriting `Invariant.status` when only telemetry such as `checkID`, `reportRef`, or checked row count changes. The next production milestone is replacing the local worker report store with object storage.
 
 ## Research-Informed Novelty Wedge
 
@@ -35,7 +60,7 @@ KubeDataGuard should not compete with any of those directly.
 Its sharper contribution is:
 
 ```text
-Kubernetes-native reconciliation of cross-system derived-data correctness.
+Evidence-backed reconciliation of cross-system derived-data correctness.
 ```
 
 That means the project should become the missing layer between infrastructure health and data quality:
@@ -48,9 +73,9 @@ The most novel version of this project is not "a checker." It is a data-correctn
 
 - `DataSource`, `DerivedView`, `Invariant`, and `RepairPolicy` CRDs
 - lineage-bound invariants that know how data is supposed to move
-- `Invariant.status` as the compact Kubernetes truth
+- `Invariant.status` as compact Kubernetes truth when the operator wrapper is used
 - durable drift reports as evidence
-- repair provenance showing exactly what was changed and why
+- repair provenance showing exactly what was requested and why
 - checker failure states that are distinct from data-drift states
 - OpenTelemetry traces for check and repair cycles
 - optional OpenLineage emission so the data ecosystem can see the same lineage graph
@@ -113,9 +138,9 @@ The project is built around four ideas:
    - A rule that must remain true.
    - Example: every paid order in Postgres must appear in the search index within 60 seconds.
 
-4. Repair
-   - A controlled action that makes a bad derived view trustworthy again.
-   - Example: replay Kafka events, reindex missing records, invalidate Redis keys, or run a backfill job.
+4. Reconciliation
+   - A controlled action that asks the owning pipeline to make a derived view trustworthy again.
+   - Example: publish a reconcile event, call an owner service webhook, replay Kafka events, invalidate Redis keys, run a backfill job, or, in a local demo only, direct reindex from the source.
 
 ## DDIA Concepts
 
@@ -228,13 +253,13 @@ Current closed-loop operator path:
 - runs the Python checker against Postgres, Redpanda/Kafka, and OpenSearch
 - stores compact `status.json` and repair input in a report ConfigMap
 - writes full JSON/Markdown reports to the worker report store and keeps only the report reference in status
-- if drift is detected, finds an auto-approved `RepairPolicy`
-- creates a repair Job for allowed `reindex-records` repair
-- repair Job reindexes from Postgres into OpenSearch and verifies the invariant
-- copies compact checker or repair `status.json` into `Invariant.status`
+- if drift is detected, finds an explicitly allowed `RepairPolicy`
+- never auto-runs direct `reindex-records` unless the policy has `approvalRequired: false` and the unsafe opt-in annotation `dataguard.io/allow-unsafe-direct-reindex: "true"`
+- repair Jobs can run direct reindex for controlled demos or emit reconciliation requests for safer owner-executed repair
+- copies compact checker or repair `status.json` into `Invariant.status` only when semantic health changes
 - still keeps synthetic mode available for controller smoke tests
 
-This proves the Kubernetes-native control loop: the operator reconciles a declared data SLO, a Job performs the data check, a policy-approved repair Job fixes drift, and the CRD status reflects the verified consistency state.
+This proves the Kubernetes-native control loop without making Kubernetes the row-level data plane: the operator reconciles a declared data SLO, a Job performs the data check, the full evidence lives outside CRD status, and the CRD status reflects only the compact verified consistency state.
 
 ## Core Custom Resources
 
@@ -315,8 +340,19 @@ spec:
     select id, status, amount_cents, currency, version, updated_at
     from orders
     where status = 'paid'
+      and updated_at <= now() - interval '60 seconds'
+    order by updated_at asc, id asc
   targetQuery: |
-    {"query":{"term":{"status":"paid"}},"size":10000}
+    {
+      "query": {
+        "bool": {
+          "filter": [
+            {"term": {"status": "paid"}},
+            {"range": {"updated_at": {"lte": "now-60s"}}}
+          ]
+        }
+      }
+    }
 ```
 
 ### RepairPolicy
@@ -327,13 +363,23 @@ Describes what may happen when an invariant fails.
 apiVersion: dataguard.io/v1alpha1
 kind: RepairPolicy
 metadata:
-  name: reindex-missing-paid-orders
+  name: reconcile-missing-paid-orders
 spec:
   invariantRef: paid-orders-indexed
-  approvalRequired: false
+  approvalRequired: true
   actions:
-    - type: reindex-records
+    - type: emit-reconcile-events
       batchSize: 500
+```
+
+Direct automatic `reindex-records` is intentionally fenced off. For a controlled demo or explicitly accepted risk, a policy must set both:
+
+```yaml
+metadata:
+  annotations:
+    dataguard.io/allow-unsafe-direct-reindex: "true"
+spec:
+  approvalRequired: false
 ```
 
 ## Reconciliation Loop
@@ -732,7 +778,7 @@ Expected behavior:
 - Implemented job-backed `Invariant` reconciliation
 - Implemented checker Job creation and compact ConfigMap status handoff
 - Implemented scheduled checker Jobs through `spec.checkIntervalSeconds`
-- Implemented repair Job creation from auto-approved `RepairPolicy`
+- Implemented repair Job creation from explicitly allowed `RepairPolicy`
 - Implemented repair result ConfigMap handoff and verified status update
 - Added operator Dockerfile and in-cluster Deployment/RBAC sketch
 - Enabled CRD `status` subresource

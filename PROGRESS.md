@@ -2,7 +2,7 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has now been hardened against the first major critique.
 
 The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
 
@@ -20,6 +20,8 @@ The project now has Docker Compose infrastructure, Python CLI commands, invarian
 - Include CRD sketches early; build the data-integrated controller only after the local loop is runtime-verified.
 - Keep external-service imports lazy so the no-Docker proof can run without Postgres/Kafka/OpenSearch client packages.
 - Use a hybrid implementation model: Go operator for Kubernetes reconciliation, Python checker/repair workers for data integrations and invariant logic.
+- Treat Kubernetes as the control plane, not the row-level data plane.
+- Do not auto-run direct derived-store writes unless a `RepairPolicy` explicitly opts into unsafe direct reindex.
 
 ## Demo Story
 
@@ -235,10 +237,10 @@ Implemented and verified now:
   - in-cluster checker repair input
 - Added Go controller logic that:
   - detects `DriftDetected` checker reports
-  - finds an auto-approved `RepairPolicy`
+  - finds an explicitly allowed `RepairPolicy`
   - creates one deterministic repair Job per `Invariant` generation
   - passes the checker report ConfigMap into the repair Job
-  - lets the repair Job reindex missing/stale records from Postgres into OpenSearch
+  - lets the repair Job reindex missing/stale records in controlled unsafe demo mode
   - verifies the invariant after repair
   - reads the repair result ConfigMap before the stale drift report
   - patches `Invariant.status` to `Healthy` or `RepairFailed`
@@ -352,7 +354,7 @@ New behavior:
 - Added `make repair-freshness`.
 - Local repair can now verify `existence`, `aggregate`, or `freshness`.
 - Repair now treats `freshness_violations` as source-of-truth reindex candidates.
-- Added an auto-approved freshness `RepairPolicy` to the example resources.
+- Added a freshness `RepairPolicy` to the example resources; it now defaults to approval-required reconciliation events.
 - Split freshness evidence into:
   - `freshness_violations`: current actionable drift
   - `freshness_breaches`: historical bounded-freshness SLO misses
@@ -367,8 +369,8 @@ Current repair semantics:
 
 ```text
 freshness violation order ids
-  -> fetch source rows from Postgres
-  -> reindex OpenSearch documents
+  -> local demo can fetch source rows from Postgres and reindex OpenSearch documents
+  -> safer production path emits reconciliation requests for the owning pipeline
   -> verify paid-orders-freshness
   -> preserve historical SLO breach evidence separately in the report
 ```
@@ -392,7 +394,7 @@ Implemented the first response to the architectural critique.
 
 What changed:
 
-- README now explicitly says this is a research-grade vertical-slice MVP, not a production-ready general data platform.
+- README now positions this as an evidence-first consistency engine with an optional Kubernetes control-plane wrapper, not a system that uses Kubernetes as a row-level data plane.
 - Added `spec.checkIntervalSeconds` to `Invariant`.
 - Added scheduled checker Jobs with `checkID` values derived from generation and interval slot.
 - Added `checkID`, `checkIntervalSeconds`, and `nextCheckAfter` status fields.
@@ -409,6 +411,11 @@ What changed:
 - Added `k8s/operator.yaml` with operator Deployment/RBAC.
 - Added `make operator-image`.
 - Added `paid-orders-query-check` example `Invariant`.
+- Removed the OpenSearch `size: 10000` correctness cap by paginating target queries with `search_after`.
+- Changed checked-in `RepairPolicy` examples to `approvalRequired: true` and `emit-reconcile-events`.
+- Added unsafe opt-in fencing for automatic direct `reindex-records` repair.
+- Added `emit-reconcile-events` worker repair mode.
+- Reduced Kubernetes status churn by ignoring telemetry-only changes such as `checkID`, `reportRef`, and checked row count when semantic health has not changed.
 
 What this fixes:
 
@@ -417,6 +424,40 @@ sourceQuery/targetQuery are no longer purely decorative for the new query invari
 SLO checks can now repeat without spec edits.
 ConfigMaps no longer carry full drift report blobs.
 The Go operator can be built and deployed as a real in-cluster component.
+OpenSearch target checks no longer silently stop at 10,000 documents.
+Repair defaults no longer teach automatic direct writes into a derived store.
+Repeated healthy scheduled checks do not rewrite Invariant.status just to publish telemetry.
+```
+
+Verification for this hardening pass:
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests
+  Passed: 18 tests
+
+python3 -m py_compile $(find src -name '*.py' | sort)
+  Passed
+
+go test ./...
+  Passed
+
+ruby YAML parse for Compose, CRDs, operator manifest, and examples
+  Passed
+
+make demo-local
+  Passed: drift -> evidence -> repair -> healthy verification
+
+docker compose build dataguard
+  Passed
+
+go build -o /tmp/dataguard-operator ./cmd/dataguard-operator
+  Passed
+```
+
+Verification note:
+
+```text
+make operator-image was started, but the legacy Docker build process became silent for several minutes while compiling the operator image and was interrupted manually. This was not a source compile failure; local go build and go test both passed.
 ```
 
 What remains intentionally open:

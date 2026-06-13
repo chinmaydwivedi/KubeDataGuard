@@ -71,6 +71,11 @@ def main() -> None:
 
     repair_parser = subcommands.add_parser("repair", help="repair drift from a report")
     repair_parser.add_argument("--report", type=Path)
+    repair_parser.add_argument(
+        "--repair-mode",
+        choices=["direct-reindex", "emit-reconcile-events"],
+        default="direct-reindex",
+    )
     repair_parser.add_argument("--verify", action="store_true")
     repair_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_parser.add_argument(
@@ -90,6 +95,11 @@ def main() -> None:
     repair_job_parser.add_argument("--invariant-name", required=True)
     repair_job_parser.add_argument("--observed-generation", type=int, default=0)
     repair_job_parser.add_argument("--check-id", default="")
+    repair_job_parser.add_argument(
+        "--repair-mode",
+        choices=["direct-reindex", "emit-reconcile-events"],
+        default="direct-reindex",
+    )
     repair_job_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_job_parser.add_argument(
         "--verify-invariant",
@@ -282,7 +292,7 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
     from . import checker, repair
 
     report_path = args.report or settings.report_dir / "latest.json"
-    result = repair.repair_from_report(settings, report_path)
+    result = repair.repair_from_report(settings, report_path, mode=args.repair_mode)
     print(json.dumps(result, indent=2, sort_keys=True))
     if args.verify:
         report = check_invariant(
@@ -310,7 +320,7 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
     source_data = read_configmap_data(namespace=namespace, name=args.report_config_map)
     source_report = json.loads(source_data.get("repair-input.json") or source_data["report.json"])
 
-    repair_result = repair.repair_from_payload(settings, source_report)
+    repair_result = repair.repair_from_payload(settings, source_report, mode=args.repair_mode)
     repair_result["sourceReportRef"] = source_report_ref
 
     verification = check_invariant(
@@ -333,6 +343,7 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
         source_report_ref=source_report_ref,
         repair_report_ref=repair_report_ref,
         repair_result=repair_result,
+        repair_action=args.repair_mode,
         verification=verification,
         verification_payload=verification_payload,
         observed_generation=args.observed_generation,
@@ -408,6 +419,7 @@ def build_repair_job_result(
     source_report_ref: str,
     repair_report_ref: str,
     repair_result: dict,
+    repair_action: str,
     verification,
     verification_payload: dict | None = None,
     observed_generation: int,
@@ -419,7 +431,7 @@ def build_repair_job_result(
     if check_id:
         status["checkID"] = check_id
     status["repairRef"] = repair_report_ref
-    status["repairAction"] = "reindex-records"
+    status["repairAction"] = repair_action
     if not verification.healthy:
         status["phase"] = "RepairFailed"
         status["healthy"] = False
