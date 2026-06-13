@@ -15,6 +15,7 @@ from dataguard.invariants import (
 from dataguard.cli import build_repair_job_result
 from dataguard.local_demo import run_local_proof
 from dataguard.repair import repair_from_payload
+from dataguard.reporting import write_report_artifacts
 from dataguard.search import execute_target_query
 
 
@@ -503,6 +504,62 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertNotIn("search_after", fake_client.requests[0][1])
         self.assertEqual(fake_client.requests[1][1]["search_after"], ["order-1", "order-1"])
         self.assertIn("sort", fake_client.requests[0][1])
+
+    def test_write_report_artifacts_defaults_to_local_file_refs(self):
+        source = [
+            {
+                "id": "order-1",
+                "status": "paid",
+                "amount_cents": 1200,
+                "currency": "USD",
+                "version": 1,
+            }
+        ]
+        report = compare_paid_orders_to_index(source, {"order-1": dict(source[0])})
+
+        with TemporaryDirectory() as tmpdir:
+            settings = SimpleNamespace(report_dir=Path(tmpdir), report_store="local")
+            artifacts = write_report_artifacts(settings, report)
+
+            self.assertTrue(artifacts.json_path.exists())
+            self.assertTrue(artifacts.markdown_path.exists())
+            self.assertTrue(artifacts.latest_path.exists())
+            self.assertTrue(artifacts.report_ref.startswith("file://"))
+            self.assertTrue(artifacts.latest_ref.endswith("/latest.json"))
+
+    def test_write_report_artifacts_can_publish_to_s3_compatible_store(self):
+        source = [
+            {
+                "id": "order-1",
+                "status": "paid",
+                "amount_cents": 1200,
+                "currency": "USD",
+                "version": 1,
+            }
+        ]
+        report = compare_paid_orders_to_index(source, {})
+        fake_s3 = SimpleNamespace(upload_file=Mock())
+        fake_boto3 = SimpleNamespace(client=Mock(return_value=fake_s3))
+
+        with TemporaryDirectory() as tmpdir, patch.dict("sys.modules", {"boto3": fake_boto3}):
+            settings = SimpleNamespace(
+                report_dir=Path(tmpdir),
+                report_store="s3",
+                report_bucket="kubedataguard-reports",
+                report_prefix="test-run",
+                report_s3_endpoint_url="http://minio:9000",
+                aws_region="us-east-1",
+            )
+            artifacts = write_report_artifacts(settings, report)
+
+        fake_boto3.client.assert_called_once_with(
+            "s3",
+            region_name="us-east-1",
+            endpoint_url="http://minio:9000",
+        )
+        self.assertEqual(fake_s3.upload_file.call_count, 3)
+        self.assertTrue(artifacts.report_ref.startswith("s3://kubedataguard-reports/test-run/drift-"))
+        self.assertEqual(artifacts.latest_ref, "s3://kubedataguard-reports/test-run/latest.json")
 
     def test_repair_job_result_stays_healthy_when_verification_passes(self):
         source = [

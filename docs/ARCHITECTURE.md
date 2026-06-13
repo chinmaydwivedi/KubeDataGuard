@@ -127,6 +127,7 @@ check command
   |-- mget same ids from OpenSearch
   |-- classify missing/stale/aggregate/freshness drift
   |-- preserve source LSN and stream offset evidence
+  |-- write JSON/Markdown reports locally and optionally to S3/MinIO
   |
 repair command
   |
@@ -139,7 +140,7 @@ operator check-job path
   |-- watch Invariant resources
   |-- create one checker Job per Invariant generation or scheduled check interval
   |-- run the Python checker in Kubernetes
-  |-- write full report to the worker report store
+  |-- write full report to the worker report store or S3/MinIO
   |-- write compact status.json and repair-input.json into a ConfigMap
   |-- patch Invariant.status from status.json
 
@@ -328,6 +329,8 @@ The controller creates or ensures:
 - compact report ConfigMap handoff
 - repair Job when an allowed RepairPolicy exists
 - repair result ConfigMap handoff
+
+Full drift evidence is not stored in `Invariant.status` or ConfigMap payloads. The worker writes complete JSON/Markdown artifacts to `REPORT_DIR` and, when configured with `REPORT_STORE=s3`, uploads the same evidence to an S3-compatible store. Kubernetes status carries the compact phase plus `reportRef`.
 
 Scheduled invariants use `spec.checkIntervalSeconds`. The controller computes a `checkID` from the invariant generation and the current interval slot. That gives repeated checks without duplicate Jobs inside the same interval.
 

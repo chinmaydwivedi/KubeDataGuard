@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has now been hardened against the first major critique.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique and now has optional S3/MinIO-compatible evidence storage.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
 
 ## Decisions Made
 
@@ -22,6 +22,7 @@ The project now has Docker Compose infrastructure, Python CLI commands, invarian
 - Use a hybrid implementation model: Go operator for Kubernetes reconciliation, Python checker/repair workers for data integrations and invariant logic.
 - Treat Kubernetes as the control plane, not the row-level data plane.
 - Do not auto-run direct derived-store writes unless a `RepairPolicy` explicitly opts into unsafe direct reindex.
+- Store full drift evidence outside Kubernetes; use Kubernetes status for compact phase and report references only.
 
 ## Demo Story
 
@@ -460,14 +461,77 @@ Verification note:
 make operator-image was started, but the legacy Docker build process became silent for several minutes while compiling the operator image and was interrupted manually. This was not a source compile failure; local go build and go test both passed.
 ```
 
+## Latest Evidence Store Pass
+
+Implemented the next response to the Kubernetes-as-data-plane critique.
+
+What changed:
+
+- Added report-store settings:
+  - `REPORT_STORE=local|s3`
+  - `REPORT_BUCKET`
+  - `REPORT_PREFIX`
+  - `REPORT_S3_ENDPOINT_URL`
+  - `AWS_REGION`
+- Added `ReportArtifacts` so report writing returns:
+  - local JSON path
+  - local Markdown path
+  - local latest path
+  - durable report ref
+  - durable Markdown ref
+  - durable latest ref
+- Kept local reports as the default and as the first write path.
+- Added optional S3-compatible publication for JSON, Markdown, and `latest.json`.
+- Added optional MinIO services to Docker Compose.
+- Added `make up-object-store`.
+- Added `make check-s3`.
+- Wired operator-created checker and repair Jobs with report-store env configuration from annotations.
+- Left credentials out of CRD fields; production should use pod identity, mounted Secrets, or platform-level env injection.
+
+What this fixes:
+
+```text
+Full evidence reports no longer have to live only on an ephemeral worker filesystem.
+Invariant.status.reportRef can point at durable s3:// evidence.
+ConfigMaps remain compact handoff objects instead of becoming row-level evidence blobs.
+```
+
+Verification for this evidence-store pass:
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests
+  Passed: 20 tests
+
+python3 -m py_compile $(find src -name '*.py' | sort)
+  Passed
+
+go test ./...
+  Passed
+
+ruby YAML parse for Compose, CRDs, operator manifest, and examples
+  Passed
+
+docker compose build dataguard
+  Passed
+
+go build -o /tmp/dataguard-operator ./cmd/dataguard-operator
+  Passed
+
+make up-object-store && make seed && make drift && make check-s3
+  Passed: checker reported DriftDetected with report ref s3://kubedataguard-reports/local/drift-*.json
+
+docker compose --profile object-store run --rm --entrypoint /bin/sh minio-mc -c 'mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null && mc ls local/kubedataguard-reports/local'
+  Passed: drift JSON, drift Markdown, and latest.json present in MinIO
+```
+
 What remains intentionally open:
 
 ```text
 generic query support is currently Postgres -> OpenSearch only
 large scans still need DBLog-style chunking/watermarks/resume
-full reports need production object storage
+object-store reports still need retention, encryption, lifecycle policy, and compaction
 DataSource connectionSecret is still not wired into Jobs
-repair strategies beyond source-of-truth reindexing remain future work
+production repair dispatch beyond local JSONL reconciliation events remains future work
 ```
 
 Runtime-verified:

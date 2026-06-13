@@ -13,6 +13,11 @@ class Settings:
     opensearch_url: str
     orders_index: str
     report_dir: Path
+    report_store: str
+    report_bucket: str
+    report_prefix: str
+    report_s3_endpoint_url: str
+    aws_region: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -29,5 +34,12 @@ class Settings:
             opensearch_url=os.getenv("OPENSEARCH_URL", "http://localhost:9200"),
             orders_index=os.getenv("ORDERS_INDEX", "orders"),
             report_dir=Path(os.getenv("REPORT_DIR", "reports")),
+            report_store=os.getenv("REPORT_STORE", "local"),
+            report_bucket=os.getenv("REPORT_BUCKET", ""),
+            report_prefix=os.getenv("REPORT_PREFIX", "kubedataguard/reports"),
+            report_s3_endpoint_url=os.getenv(
+                "REPORT_S3_ENDPOINT_URL",
+                os.getenv("AWS_ENDPOINT_URL", ""),
+            ),
+            aws_region=os.getenv("AWS_REGION", "us-east-1"),
         )
-

@@ -230,7 +230,7 @@ def run_inject_freshness_drift(settings: Settings, args: argparse.Namespace) -> 
 
 def run_check(settings: Settings, args: argparse.Namespace):
     from . import checker
-    from .reporting import write_reports
+    from .reporting import write_report_artifacts
 
     report = check_invariant(
         checker,
@@ -247,15 +247,16 @@ def run_check(settings: Settings, args: argparse.Namespace):
     payload = report.to_dict()
     print(json.dumps(payload, indent=2, sort_keys=True))
     if args.write_report:
-        json_path, markdown_path = write_reports(settings.report_dir, report)
-        print(f"wrote {json_path}")
-        print(f"wrote {markdown_path}")
+        artifacts = write_report_artifacts(settings, report)
+        print(f"wrote {artifacts.json_path}")
+        print(f"wrote {artifacts.markdown_path}")
+        print(f"report ref {artifacts.report_ref}")
 
 
 def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
     from . import checker
     from .k8s_report import namespace_from_service_account, publish_report_configmap
-    from .reporting import write_reports
+    from .reporting import write_report_artifacts
 
     report = check_invariant(
         checker,
@@ -270,9 +271,8 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
     )
 
     payload = report.to_dict()
-    json_path, _markdown_path = write_reports(settings.report_dir, report)
-    report_ref = f"file://{json_path}"
-    status = report.kubernetes_status(report_ref=report_ref)
+    artifacts = write_report_artifacts(settings, report)
+    status = report.kubernetes_status(report_ref=artifacts.report_ref)
     status["observedGeneration"] = args.observed_generation
     if args.check_id:
         status["checkID"] = args.check_id
@@ -313,7 +313,7 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
 def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
     from . import checker, repair
     from .k8s_report import namespace_from_service_account, publish_report_configmap, read_configmap_data
-    from .reporting import write_reports
+    from .reporting import write_report_artifacts
 
     namespace = args.namespace or namespace_from_service_account()
     source_report_ref = f"configmap://{namespace}/{args.report_config_map}/repair-input.json"
@@ -336,12 +336,11 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
     )
 
     verification_payload = verification.to_dict()
-    json_path, _markdown_path = write_reports(settings.report_dir, verification)
-    repair_report_ref = f"file://{json_path}"
+    artifacts = write_report_artifacts(settings, verification)
     payload, status = build_repair_job_result(
         invariant_name=args.invariant_name,
         source_report_ref=source_report_ref,
-        repair_report_ref=repair_report_ref,
+        repair_report_ref=artifacts.report_ref,
         repair_result=repair_result,
         repair_action=args.repair_mode,
         verification=verification,

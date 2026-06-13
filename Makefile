@@ -2,10 +2,13 @@ COMPOSE ?= docker compose
 PYTHON ?= python3
 APP = $(COMPOSE) run --rm dataguard
 
-.PHONY: up down reset init seed generate index drift drift-freshness check check-aggregate check-freshness repair repair-freshness demo-local demo-drift demo-freshness-drift demo-repair test operator-test operator-build operator-image
+.PHONY: up up-object-store down reset init seed generate index drift drift-freshness check check-aggregate check-freshness check-s3 repair repair-freshness demo-local demo-drift demo-freshness-drift demo-repair test operator-test operator-build operator-image
 
 up:
 	$(COMPOSE) up -d postgres redpanda-0 redpanda-console opensearch
+
+up-object-store:
+	$(COMPOSE) --profile object-store up -d minio minio-mc
 
 down:
 	$(COMPOSE) down
@@ -40,6 +43,9 @@ check-aggregate:
 
 check-freshness:
 	$(APP) check --invariant freshness --max-lag-seconds 60 --write-report
+
+check-s3:
+	REPORT_STORE=s3 REPORT_BUCKET=kubedataguard-reports REPORT_PREFIX=local REPORT_S3_ENDPOINT_URL=http://minio:9000 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin $(APP) check --max-lag-seconds 0 --write-report
 
 repair:
 	$(APP) repair --verify

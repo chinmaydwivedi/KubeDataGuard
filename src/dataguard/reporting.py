@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .config import Settings
 from .invariants import DriftReport
+
+
+@dataclass(frozen=True)
+class ReportArtifacts:
+    json_path: Path
+    markdown_path: Path
+    latest_path: Path
+    report_ref: str
+    markdown_ref: str
+    latest_ref: str
 
 
 def write_reports(report_dir: Path, report: DriftReport) -> tuple[Path, Path]:
@@ -19,6 +31,80 @@ def write_reports(report_dir: Path, report: DriftReport) -> tuple[Path, Path]:
     latest_path = report_dir / "latest.json"
     latest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return json_path, markdown_path
+
+
+def write_report_artifacts(settings: Settings, report: DriftReport) -> ReportArtifacts:
+    json_path, markdown_path = write_reports(settings.report_dir, report)
+    latest_path = settings.report_dir / "latest.json"
+    local = ReportArtifacts(
+        json_path=json_path,
+        markdown_path=markdown_path,
+        latest_path=latest_path,
+        report_ref=file_ref(json_path),
+        markdown_ref=file_ref(markdown_path),
+        latest_ref=file_ref(latest_path),
+    )
+    if report_store(settings) == "local":
+        return local
+    if report_store(settings) == "s3":
+        return publish_s3_artifacts(settings, local)
+    raise ValueError(f"unsupported REPORT_STORE: {settings.report_store}")
+
+
+def report_store(settings: Settings) -> str:
+    return (getattr(settings, "report_store", "local") or "local").strip().lower()
+
+
+def file_ref(path: Path) -> str:
+    return f"file://{path}"
+
+
+def publish_s3_artifacts(settings: Settings, artifacts: ReportArtifacts) -> ReportArtifacts:
+    if not settings.report_bucket:
+        raise ValueError("REPORT_BUCKET is required when REPORT_STORE=s3")
+
+    client = s3_client(settings)
+    uploads = [
+        (artifacts.json_path, s3_key(settings, artifacts.json_path), "application/json"),
+        (artifacts.markdown_path, s3_key(settings, artifacts.markdown_path), "text/markdown"),
+        (artifacts.latest_path, s3_key(settings, artifacts.latest_path), "application/json"),
+    ]
+    for path, key, content_type in uploads:
+        client.upload_file(
+            str(path),
+            settings.report_bucket,
+            key,
+            ExtraArgs={"ContentType": content_type},
+        )
+
+    return ReportArtifacts(
+        json_path=artifacts.json_path,
+        markdown_path=artifacts.markdown_path,
+        latest_path=artifacts.latest_path,
+        report_ref=s3_ref(settings.report_bucket, uploads[0][1]),
+        markdown_ref=s3_ref(settings.report_bucket, uploads[1][1]),
+        latest_ref=s3_ref(settings.report_bucket, uploads[2][1]),
+    )
+
+
+def s3_client(settings: Settings):
+    import boto3
+
+    kwargs: dict[str, str] = {"region_name": settings.aws_region}
+    if settings.report_s3_endpoint_url:
+        kwargs["endpoint_url"] = settings.report_s3_endpoint_url
+    return boto3.client("s3", **kwargs)
+
+
+def s3_key(settings: Settings, path: Path) -> str:
+    prefix = settings.report_prefix.strip("/")
+    if not prefix:
+        return path.name
+    return f"{prefix}/{path.name}"
+
+
+def s3_ref(bucket: str, key: str) -> str:
+    return f"s3://{bucket}/{key}"
 
 
 def markdown_report(payload: dict[str, Any]) -> str:

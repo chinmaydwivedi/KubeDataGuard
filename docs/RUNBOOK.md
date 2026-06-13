@@ -363,6 +363,42 @@ ${HOME}/.kubedataguard/reports/drift-*.json
 ${HOME}/.kubedataguard/reports/drift-*.md
 ```
 
+## Durable Report Store Demo
+
+The local file report store is the default. To exercise an S3-compatible evidence sink with MinIO:
+
+```sh
+make up-object-store
+make seed
+make drift
+make check-s3
+```
+
+The `check-s3` target runs the normal checker with:
+
+```text
+REPORT_STORE=s3
+REPORT_BUCKET=kubedataguard-reports
+REPORT_PREFIX=local
+REPORT_S3_ENDPOINT_URL=http://minio:9000
+AWS_ACCESS_KEY_ID=minioadmin
+AWS_SECRET_ACCESS_KEY=minioadmin
+```
+
+Expected behavior:
+
+```text
+reports still appear under ${HOME}/.kubedataguard/reports
+the checker also uploads drift-*.json, drift-*.md, and latest.json to MinIO
+the printed report ref is s3://kubedataguard-reports/local/drift-*.json
+```
+
+MinIO console:
+
+```text
+http://localhost:9001
+```
+
 ## Repair Demo
 
 ```sh

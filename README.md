@@ -17,6 +17,7 @@ What is implemented and verified:
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
 - Compact Kubernetes status handoff through ConfigMaps.
 - Full JSON/Markdown reports written to the worker report store and referenced from status.
+- Optional S3/MinIO-compatible durable report publication with `s3://...` status refs.
 - Direct source-of-truth reindex repair for explicit local demos.
 - Safer reconciliation-event repair mode for owner-executed remediation.
 - Operator safeguards that avoid status churn for repeated healthy scheduled checks.
@@ -25,7 +26,7 @@ What is intentionally not solved yet:
 
 - Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
 - Large-scale DBLog-style chunked, resumable source scans.
-- Production object-store report persistence such as S3/GCS/MinIO.
+- Object-store lifecycle policy, retention, encryption, and report compaction.
 - Kubernetes Secret-backed connection loading from `DataSource` resources.
 - Production repair integrations such as Kafka replay, webhook dispatch, cache invalidation, and analytics backfill.
 
@@ -49,7 +50,28 @@ Invariant CRD / CLI config
   -> owner-approved reconciliation request
 ```
 
-That boundary matters because a real drift report can contain thousands or millions of counterexamples. Kubernetes should hold the pointer and the phase, not the blob. The checked-in operator already keeps ConfigMaps compact and avoids rewriting `Invariant.status` when only telemetry such as `checkID`, `reportRef`, or checked row count changes. The next production milestone is replacing the local worker report store with object storage.
+That boundary matters because a real drift report can contain thousands or millions of counterexamples. Kubernetes should hold the pointer and the phase, not the blob. The checked-in operator keeps ConfigMaps compact, avoids rewriting `Invariant.status` when only telemetry such as `checkID`, `reportRef`, or checked row count changes, and can publish full evidence reports to an S3-compatible store.
+
+## Evidence Storage
+
+Local files remain the default:
+
+```text
+REPORT_STORE=local
+REPORT_DIR=/workspace/reports
+```
+
+For durable evidence, configure an S3-compatible sink:
+
+```text
+REPORT_STORE=s3
+REPORT_BUCKET=kubedataguard-reports
+REPORT_PREFIX=prod/orders
+REPORT_S3_ENDPOINT_URL=http://minio:9000   # optional, for MinIO/S3-compatible stores
+AWS_REGION=us-east-1
+```
+
+The worker always writes local JSON/Markdown artifacts first, then uploads the report, Markdown summary, and `latest.json` when `REPORT_STORE=s3`. `Invariant.status.reportRef` becomes an `s3://bucket/key` pointer while the full counterexample evidence stays outside Kubernetes.
 
 ## Research-Informed Novelty Wedge
 
@@ -413,7 +435,7 @@ Invariant CRD
   |-- computes checkID from generation or checkIntervalSeconds time slot
   |-- creates dataguard-check-<invariant>-<checkID> Job
   |-- Python checker connects to Postgres, Redpanda/Kafka, and OpenSearch
-  |-- Python checker writes full report to REPORT_DIR
+  |-- Python checker writes full report to REPORT_DIR and optionally S3/MinIO
   |-- Python checker writes compact status.json and repair-input.json into a ConfigMap
   |-- Go operator copies status.json into Invariant.status
   |-- Go operator requeues scheduled invariants for the next check interval

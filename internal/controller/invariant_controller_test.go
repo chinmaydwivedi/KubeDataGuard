@@ -95,6 +95,11 @@ func TestBuildCheckerJobUsesInvariantConfiguration(t *testing.T) {
 			AnnotationKafkaBootstrapServers: "redpanda:9092",
 			AnnotationOpenSearchURL:         "http://opensearch:9200",
 			AnnotationOrdersIndex:           "orders-v2",
+			AnnotationReportStore:           "s3",
+			AnnotationReportBucket:          "reports-bucket",
+			AnnotationReportPrefix:          "checks/prod",
+			AnnotationReportS3EndpointURL:   "http://minio:9000",
+			AnnotationAWSRegion:             "us-west-2",
 		},
 	)
 
@@ -134,6 +139,21 @@ func TestBuildCheckerJobUsesInvariantConfiguration(t *testing.T) {
 	}
 	if env["ORDERS_INDEX"] != "orders-v2" {
 		t.Fatalf("ORDERS_INDEX = %q", env["ORDERS_INDEX"])
+	}
+	if env["REPORT_STORE"] != "s3" {
+		t.Fatalf("REPORT_STORE = %q", env["REPORT_STORE"])
+	}
+	if env["REPORT_BUCKET"] != "reports-bucket" {
+		t.Fatalf("REPORT_BUCKET = %q", env["REPORT_BUCKET"])
+	}
+	if env["REPORT_PREFIX"] != "checks/prod" {
+		t.Fatalf("REPORT_PREFIX = %q", env["REPORT_PREFIX"])
+	}
+	if env["REPORT_S3_ENDPOINT_URL"] != "http://minio:9000" {
+		t.Fatalf("REPORT_S3_ENDPOINT_URL = %q", env["REPORT_S3_ENDPOINT_URL"])
+	}
+	if env["AWS_REGION"] != "us-west-2" {
+		t.Fatalf("AWS_REGION = %q", env["AWS_REGION"])
 	}
 }
 

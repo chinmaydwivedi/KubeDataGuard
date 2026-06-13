@@ -32,6 +32,11 @@ const (
 	AnnotationOrdersIndex           = "dataguard.io/orders-index"
 	AnnotationOrderEventsTopic      = "dataguard.io/order-events-topic"
 	AnnotationAllowUnsafeReindex    = "dataguard.io/allow-unsafe-direct-reindex"
+	AnnotationReportStore           = "dataguard.io/report-store"
+	AnnotationReportBucket          = "dataguard.io/report-bucket"
+	AnnotationReportPrefix          = "dataguard.io/report-prefix"
+	AnnotationReportS3EndpointURL   = "dataguard.io/report-s3-endpoint-url"
+	AnnotationAWSRegion             = "dataguard.io/aws-region"
 
 	CheckPartial = "partial"
 	CheckFailed  = "failed"
@@ -46,6 +51,9 @@ const (
 	DefaultOpenSearchURL         = "http://host.docker.internal:9200"
 	DefaultOrdersIndex           = "orders"
 	DefaultReportDir             = "/tmp/dataguard-reports"
+	DefaultReportStore           = "local"
+	DefaultReportPrefix          = "kubedataguard/reports"
+	DefaultAWSRegion             = "us-east-1"
 )
 
 type CheckRun struct {
@@ -715,6 +723,11 @@ func checkerEnv(invariant *unstructured.Unstructured) []corev1.EnvVar {
 		{Name: "OPENSEARCH_URL", Value: annotationOrDefault(invariant, AnnotationOpenSearchURL, DefaultOpenSearchURL)},
 		{Name: "ORDERS_INDEX", Value: annotationOrDefault(invariant, AnnotationOrdersIndex, DefaultOrdersIndex)},
 		{Name: "REPORT_DIR", Value: DefaultReportDir},
+		{Name: "REPORT_STORE", Value: annotationOrDefault(invariant, AnnotationReportStore, DefaultReportStore)},
+		{Name: "REPORT_BUCKET", Value: annotationOrDefault(invariant, AnnotationReportBucket, "")},
+		{Name: "REPORT_PREFIX", Value: annotationOrDefault(invariant, AnnotationReportPrefix, DefaultReportPrefix)},
+		{Name: "REPORT_S3_ENDPOINT_URL", Value: annotationOrDefault(invariant, AnnotationReportS3EndpointURL, "")},
+		{Name: "AWS_REGION", Value: annotationOrDefault(invariant, AnnotationAWSRegion, DefaultAWSRegion)},
 	}
 }
 
