@@ -399,6 +399,51 @@ MinIO console:
 http://localhost:9001
 ```
 
+## Checkpointed Query Scan Demo
+
+For a large source table, bound each checker run and persist the last scanned key:
+
+```sh
+docker compose run --rm dataguard check \
+  --invariant query \
+  --max-lag-seconds 0 \
+  --source-scan-page-size 10 \
+  --source-max-pages 2 \
+  --source-checkpoint-id demo-paid-orders-query \
+  --source-reset-checkpoint \
+  --source-query "select id::text as id, status, amount_cents, currency, version, updated_at from orders where status = 'paid'" \
+  --target-query '{"query":{"term":{"status":"paid"}}}' \
+  --key-field id \
+  --compare-fields status,amount_cents,currency,version \
+  --write-report
+```
+
+Expected source scan evidence:
+
+```text
+observation_window.source_scan.completed: false
+observation_window.source_scan.stop_reason: max_pages
+observation_window.source_scan.checkpoint_ref: file://.../scan-checkpoints/demo-paid-orders-query.json
+check_status: partial
+```
+
+Resume from the persisted checkpoint by running the same command without `--source-reset-checkpoint` and without `--source-max-pages`:
+
+```sh
+docker compose run --rm dataguard check \
+  --invariant query \
+  --max-lag-seconds 0 \
+  --source-scan-page-size 10 \
+  --source-checkpoint-id demo-paid-orders-query \
+  --source-query "select id::text as id, status, amount_cents, currency, version, updated_at from orders where status = 'paid'" \
+  --target-query '{"query":{"term":{"status":"paid"}}}' \
+  --key-field id \
+  --compare-fields status,amount_cents,currency,version \
+  --write-report
+```
+
+The resumed report includes `loaded_checkpoint` and remains marked `partial` because it is a suffix scan, not a complete source/target snapshot.
+
 ## Repair Demo
 
 ```sh
@@ -439,7 +484,7 @@ Reports are not only pass/fail output. Key fields:
 - `observation_window`: the time and lag boundary used to decide which records are eligible
 - `observation_window.source_lsn`: the Postgres WAL position observed during freshness checks when available
 - `observation_window.stream_offset_start` and `stream_offset_end`: the event range associated with the check when available
-- `observation_window.source_scan`: keyset scan evidence for query invariants, including page size, pages read, rows read, first key, last key, and resume key
+- `observation_window.source_scan`: keyset scan evidence for query invariants, including page size, pages read, rows read, first key, last key, resume key, query hash, checkpoint ref, and loaded checkpoint summary
 - `counterexamples`: short proof objects for missing, stale, or aggregate drift
 - `missing`, `stale`, `aggregate_mismatches`, `freshness_violations`: detailed current drift classes
 - `freshness_breaches`: historical freshness SLO misses preserved for evidence after current repair convergence

@@ -14,6 +14,7 @@ What is implemented and verified:
 - Hardcoded commerce invariants for existence, aggregate consistency, and bounded freshness.
 - A first generic query invariant for Postgres source queries and OpenSearch JSON target queries.
 - Keyset-paginated Postgres source scans for query invariants, with source scan evidence in reports.
+- Persisted source-scan checkpoints for bounded query scans, stored in the same local or S3-compatible report store.
 - OpenSearch target query pagination with `search_after`; `size` is treated as page size, not a correctness cap.
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
 - Compact Kubernetes status handoff through ConfigMaps.
@@ -26,7 +27,7 @@ What is implemented and verified:
 What is intentionally not solved yet:
 
 - Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
-- Full DBLog-style CDC watermarks, persisted checkpoints, and crash-resumable scan state.
+- Full DBLog-style CDC watermarks and crash-exact scan recovery.
 - Object-store lifecycle policy, retention, encryption, and report compaction.
 - Kubernetes Secret-backed connection loading from `DataSource` resources.
 - Production repair integrations such as Kafka replay, webhook dispatch, cache invalidation, and analytics backfill.
@@ -72,7 +73,7 @@ REPORT_S3_ENDPOINT_URL=http://minio:9000   # optional, for MinIO/S3-compatible s
 AWS_REGION=us-east-1
 ```
 
-The worker always writes local JSON/Markdown artifacts first, then uploads the report, Markdown summary, and `latest.json` when `REPORT_STORE=s3`. `Invariant.status.reportRef` becomes an `s3://bucket/key` pointer while the full counterexample evidence stays outside Kubernetes.
+The worker always writes local JSON/Markdown artifacts first, then uploads the report, Markdown summary, and `latest.json` when `REPORT_STORE=s3`. `Invariant.status.reportRef` becomes an `s3://bucket/key` pointer while the full counterexample evidence stays outside Kubernetes. Query scan checkpoints use the same backend under `scan-checkpoints/`, so long scans can be bounded per run without losing the last processed key.
 
 ## Research-Informed Novelty Wedge
 
@@ -379,6 +380,8 @@ spec:
     }
 ```
 
+For intentionally bounded long scans, add `sourceCheckpointId` and `sourceMaxPages`; those runs are marked `partial` until a complete snapshot/checkpoint model exists.
+
 ### RepairPolicy
 
 Describes what may happen when an invariant fails.
@@ -540,6 +543,7 @@ python -m dataguard.cli check --invariant existence
 python -m dataguard.cli check --invariant aggregate
 python -m dataguard.cli check --invariant freshness
 python -m dataguard.cli check --invariant query --source-query "..." --target-query "..."
+python -m dataguard.cli check --invariant query --source-checkpoint-id orders-query --source-max-pages 10 --source-query "..." --target-query "..."
 python -m dataguard.cli check-job --invariant existence
 python -m dataguard.cli repair
 python -m dataguard.cli repair-job
@@ -687,7 +691,7 @@ Current report shape:
 - `status`: compact control-plane phase such as `Healthy` or `DriftDetected`
 - `guarantee`: the semantic claim being checked
 - `observation_window`: check time, target read time, max lag, eligible source boundary, source LSN, stream topic, and stream offset range
-- `observation_window.source_scan`: keyset scan mode, key field, page size, page count, row count, first key, last key, and resume key
+- `observation_window.source_scan`: keyset scan mode, key field, page size, page count, row count, first key, last key, resume key, query hash, and checkpoint reference when enabled
 - `kubernetes_status`: compact status payload used by the job-backed operator
 - `checkID`: generation or scheduled interval identifier used to make repeated checks idempotent
 - `counterexamples`: compact evidence for missing, stale, or aggregate-mismatch violations
@@ -778,6 +782,7 @@ Expected behavior:
 - Implemented bounded freshness checks using source `updated_at`, target `indexed_at`, Postgres LSN, and Kafka offset evidence
 - Implemented freshness drift injection and freshness repair verification
 - Implemented first generic Postgres/OpenSearch query invariant path
+- Implemented persisted checkpoint state for bounded source scans
 - Keep existence as the simplest invariant
 
 ### Milestone 4: Failure Taxonomy Tests

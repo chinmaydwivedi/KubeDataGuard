@@ -750,6 +750,12 @@ func appendQueryArgs(args []string, invariant *unstructured.Unstructured) []stri
 	}
 	args = append(args, "--key-field", keyField(invariant))
 	args = append(args, "--source-scan-page-size", strconv.FormatInt(sourceScanPageSize(invariant), 10))
+	if checkpointID := sourceCheckpointID(invariant); checkpointID != "" {
+		args = append(args, "--source-checkpoint-id", checkpointID)
+	}
+	if maxPages := sourceMaxPages(invariant); maxPages > 0 {
+		args = append(args, "--source-max-pages", strconv.FormatInt(maxPages, 10))
+	}
 	if fields := compareFields(invariant); fields != "" {
 		args = append(args, "--compare-fields", fields)
 	}
@@ -835,6 +841,19 @@ func sourceScanPageSize(invariant *unstructured.Unstructured) int64 {
 	}
 	if value > 5000 {
 		return 5000
+	}
+	return value
+}
+
+func sourceCheckpointID(invariant *unstructured.Unstructured) string {
+	value, _, _ := unstructured.NestedString(invariant.Object, "spec", "sourceCheckpointId")
+	return value
+}
+
+func sourceMaxPages(invariant *unstructured.Unstructured) int64 {
+	value, found, _ := unstructured.NestedInt64(invariant.Object, "spec", "sourceMaxPages")
+	if !found || value <= 0 {
+		return 0
 	}
 	return value
 }

@@ -339,12 +339,15 @@ The first generic query path is intentionally scoped:
 ```text
 Postgres sourceQuery
 keyset-paginated source scan by keyField
+optional source scan checkpoint
 OpenSearch JSON targetQuery
 keyField join
 optional compareFields equality
 ```
 
-The older commerce checks remain as optimized hardcoded demo invariants. The `query` invariant type is the first step toward making `sourceQuery` and `targetQuery` executable API fields rather than documentation-only fields. Source scans now wrap the declared query as a subquery, order by `keyField`, and fetch pages with `sourceScanPageSize`; this is the first chunking step before full DBLog-style persisted checkpoints and CDC watermarks.
+The older commerce checks remain as optimized hardcoded demo invariants. The `query` invariant type is the first step toward making `sourceQuery` and `targetQuery` executable API fields rather than documentation-only fields. Source scans now wrap the declared query as a subquery, order by `keyField`, and fetch pages with `sourceScanPageSize`.
+
+When `sourceCheckpointId` is set, bounded scans persist checkpoint state in the worker report store after each page and again at the end of the run. The checkpoint stores the query hash, check ID, key field, first and last scanned key, source watermark, source LSN, page count, row count, and stop reason. That lets the next run resume from the last processed key instead of restarting a large scan. This is still not full DBLog semantics: there is no WAL-offset-to-target proof yet, and a resumed suffix scan is marked `partial` rather than pretending it is a complete source/target snapshot.
 
 The job-backed path is enabled with:
 

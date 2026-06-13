@@ -61,6 +61,12 @@ spec:
                   minimum: 1
                   maximum: 5000
                   default: 1000
+                sourceCheckpointId:
+                  type: string
+                sourceMaxPages:
+                  type: integer
+                  minimum: 0
+                  default: 0
                 compareFields:
                   type: array
                   items:

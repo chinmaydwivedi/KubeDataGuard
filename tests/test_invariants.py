@@ -1,6 +1,6 @@
 import unittest
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -14,6 +14,11 @@ from dataguard.invariants import (
     summarize_paid_orders,
 )
 from dataguard.cli import build_repair_job_result
+from dataguard.checkpoints import (
+    load_scan_checkpoint,
+    save_scan_checkpoint,
+    update_checkpoint_report_ref,
+)
 from dataguard.db import execute_source_query_keyset
 from dataguard.local_demo import run_local_proof
 from dataguard.repair import repair_from_payload
@@ -607,6 +612,96 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(fake_conn.queries[0][1], (1,))
         self.assertEqual(fake_conn.queries[1][1], ("order-1", 1))
         self.assertIn("where \"id\" > %s", fake_conn.queries[1][0])
+
+    def test_execute_source_query_keyset_can_stop_at_max_pages(self):
+        settings = object()
+
+        class FakeCursor:
+            def __init__(self, conn):
+                self.conn = conn
+                self.page = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, query, params):
+                self.conn.queries.append((query, params))
+                self.page = self.conn.pages.pop(0)
+
+            def fetchall(self):
+                return self.page
+
+        class FakeConnection:
+            def __init__(self):
+                self.pages = [
+                    [{"id": "order-1", "updated_at": datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc)}],
+                    [{"id": "order-2", "updated_at": datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc)}],
+                    [{"id": "order-3", "updated_at": datetime(2026, 1, 1, 0, 0, 3, tzinfo=timezone.utc)}],
+                ]
+                self.queries = []
+
+            def cursor(self):
+                return FakeCursor(self)
+
+        fake_conn = FakeConnection()
+        callbacks = []
+
+        @contextmanager
+        def fake_connect(_settings):
+            yield fake_conn
+
+        with patch("dataguard.db.connect", fake_connect):
+            result = execute_source_query_keyset(
+                settings,
+                "select id, updated_at from orders",
+                key_field="id",
+                page_size=1,
+                max_pages=2,
+                on_page=callbacks.append,
+            )
+
+        self.assertEqual([row["id"] for row in result.rows], ["order-1", "order-2"])
+        self.assertEqual(len(fake_conn.queries), 2)
+        self.assertEqual(len(callbacks), 2)
+        self.assertFalse(result.evidence["completed"])
+        self.assertEqual(result.evidence["stop_reason"], "max_pages")
+        self.assertEqual(result.evidence["last_key"], "order-2")
+        self.assertEqual(result.evidence["source_watermark"], "2026-01-01T00:00:02+00:00")
+        self.assertFalse(callbacks[-1]["completed"])
+        self.assertEqual(callbacks[-1]["stop_reason"], "page")
+
+    def test_scan_checkpoint_round_trips_in_local_report_store(self):
+        with TemporaryDirectory() as tmpdir:
+            settings = SimpleNamespace(report_dir=Path(tmpdir), report_store="local")
+            ref = save_scan_checkpoint(
+                settings,
+                "orders/query checkpoint",
+                {
+                    "status": "inProgress",
+                    "query_hash": "abc123",
+                    "last_key": "order-10",
+                    "pages": 3,
+                    "rows": 3000,
+                },
+            )
+
+            loaded = load_scan_checkpoint(settings, "orders/query checkpoint")
+            update_ref = update_checkpoint_report_ref(
+                settings,
+                "orders/query checkpoint",
+                "file:///tmp/report.json",
+            )
+            updated = load_scan_checkpoint(settings, "orders/query checkpoint")
+
+        self.assertTrue(ref.startswith("file://"))
+        self.assertEqual(update_ref, ref)
+        self.assertEqual(loaded["kind"], "KubeDataGuardScanCheckpoint")
+        self.assertEqual(loaded["checkpoint_id"], "orders/query checkpoint")
+        self.assertEqual(loaded["last_key"], "order-10")
+        self.assertEqual(updated["report_ref"], "file:///tmp/report.json")
 
     def test_write_report_artifacts_defaults_to_local_file_refs(self):
         source = [

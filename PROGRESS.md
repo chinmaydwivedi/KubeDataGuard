@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, and has the first keyset-paginated source scan path.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, and persisted source-scan checkpoints.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
 
 ## Decisions Made
 
@@ -528,7 +528,7 @@ What remains intentionally open:
 
 ```text
 generic query support is currently Postgres -> OpenSearch only
-full DBLog-style watermarks, persisted checkpoints, and CDC/log-bound scan completion still need implementation
+full DBLog-style watermarks, CDC/log-bound scan completion, and crash-exact scan recovery still need implementation
 object-store reports still need retention, encryption, lifecycle policy, and compaction
 DataSource connectionSecret is still not wired into Jobs
 production repair dispatch beyond local JSONL reconciliation events remains future work
@@ -558,7 +558,7 @@ What changed:
   - resume-after key
   - completion marker
 - Added Markdown report rendering for source scan evidence.
-- Kept this explicitly narrower than DBLog: there is no persisted checkpoint store or source-log watermark reconciliation yet.
+- Kept this explicitly narrower than DBLog: this pass added scan evidence and resume boundaries before persisted checkpoint storage or source-log watermark reconciliation existed.
 
 What this fixes:
 
@@ -596,8 +596,8 @@ docker compose run --rm dataguard check --invariant query --max-lag-seconds 0 --
 What remains intentionally open:
 
 ```text
-source scan checkpoints are not persisted across Jobs yet
-source snapshot watermarks are not tied to Kafka/CDC offsets yet
+source scan checkpoints now persist the last processed key, but not a full source snapshot proof
+source snapshot watermarks are still not tied to Kafka/CDC offsets yet
 parallel chunk scans and Merkle/checksum comparison are not implemented yet
 ```
 
@@ -616,6 +616,86 @@ kind in-cluster operator:
   paid-orders-freshness: Healthy, checkID g6-t5937886, interval 300
   paid-orders-query-check: Healthy, checkID g1-t5937886, interval 300
   query ConfigMap keys: status.json, repair-input.json
+```
+
+## Latest Checkpoint Pass
+
+Implemented the next response to the full-table-scan critique: bounded source scans can now persist progress.
+
+What changed:
+
+- Added `src/dataguard/checkpoints.py`.
+- Added local and S3-compatible checkpoint storage under `scan-checkpoints/`.
+- Added CLI flags:
+  - `--source-checkpoint-id`
+  - `--source-reset-checkpoint`
+  - `--source-max-pages`
+- Added `spec.sourceCheckpointId` and `spec.sourceMaxPages` to the `Invariant` CRD.
+- Operator-created query checker Jobs now pass checkpoint ID and max-page controls.
+- Source scan evidence now includes:
+  - query hash
+  - checkpoint ID
+  - checkpoint ref
+  - loaded checkpoint summary when resuming
+- Checkpoints record:
+  - query hash
+  - check ID
+  - key field
+  - first and last scanned key
+  - source watermark
+  - source LSN
+  - page count
+  - row count
+  - stop reason
+- A checkpoint created for one query is rejected if reused for a different query hash.
+
+What this fixes:
+
+```text
+Large query checks can be intentionally bounded per Job.
+A later run can resume from the persisted last_key instead of restarting from the beginning.
+The checkpoint lives in the worker report store, not in Kubernetes status or a large ConfigMap blob.
+```
+
+What remains intentionally open:
+
+```text
+Resumed suffix scans are marked partial; they are not represented as complete snapshots.
+There is still no WAL/LSN-to-target proof that the target has processed the exact same source frontier.
+There is no parallel chunk scheduler or Merkle/checksum narrowing yet.
+```
+
+Verification for this checkpoint pass:
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests
+  Passed: 24 tests
+
+python3 -m py_compile $(find src -name '*.py' | sort)
+  Passed
+
+go test ./...
+  Passed
+
+ruby YAML parse for Compose, CRDs, operator manifest, and examples
+  Passed
+
+docker compose build dataguard
+  Passed
+
+go build -o /tmp/dataguard-operator ./cmd/dataguard-operator
+  Passed
+
+docker compose run --rm dataguard check --invariant query --source-max-pages 2 --source-checkpoint-id demo-paid-orders-query ...
+  Passed: report check_status=partial, completed=false, stop_reason=max_pages, rows=20
+  Passed: local checkpoint stored under scan-checkpoints/demo-paid-orders-query.json
+
+docker compose run --rm dataguard check --invariant query --source-checkpoint-id demo-paid-orders-query ...
+  Passed: loaded_checkpoint present, resume_after_key used, checkpoint advanced to complete
+
+REPORT_STORE=s3 ... docker compose run --rm dataguard check --invariant query --source-max-pages 1 --source-checkpoint-id demo-paid-orders-query-s3 ...
+  Passed: reportRef=s3://kubedataguard-reports/local-checkpoints/drift-*.json
+  Passed: MinIO contains scan-checkpoints/demo-paid-orders-query-s3.json
 ```
 
 ## First Build Target
@@ -934,7 +1014,8 @@ Current answer:
 - Store verbose JSON/Markdown reports externally.
 - Controller ConfigMaps now carry compact `status.json` plus `repair-input.json`.
 - `reportRef` now points at the worker report store path for full evidence reports.
-- Next blocking decision: which production report store should be implemented first: MinIO/S3, GCS, or database-backed report storage.
+- S3/MinIO-compatible report and checkpoint storage is implemented.
+- Next blocking decisions: retention/lifecycle policy, encryption posture, and Secret-backed connection resolution.
 
 ### Next Sprint
 
@@ -946,7 +1027,8 @@ Current answer:
 - Lag-aware freshness is implemented for the commerce demo.
 - First generic Postgres/OpenSearch query invariant is implemented.
 - First keyset-paginated source scan path is implemented.
-- Next: persisted scan checkpoints, CDC watermarks, and Secret-backed `DataSource` resolution.
+- Persisted scan checkpoints are implemented for bounded keyset scans.
+- Next: CDC watermarks, Secret-backed `DataSource` resolution, and checksum/Merkle narrowing.
 
 ### Future
 

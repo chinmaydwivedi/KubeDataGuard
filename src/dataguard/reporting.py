@@ -158,9 +158,19 @@ def markdown_report(payload: dict[str, Any]) -> str:
                     f"- First key: `{source_scan.get('first_key')}`",
                     f"- Last key: `{source_scan.get('last_key')}`",
                     f"- Resume after key: `{source_scan.get('resume_after_key')}`",
+                    f"- Completed: `{source_scan.get('completed')}`",
+                    f"- Stop reason: `{source_scan.get('stop_reason')}`",
+                    f"- Query hash: `{source_scan.get('query_hash')}`",
+                    f"- Checkpoint ID: `{source_scan.get('checkpoint_id')}`",
+                    f"- Checkpoint ref: `{source_scan.get('checkpoint_ref')}`",
                     "",
                 ]
             )
+            if source_scan.get("loaded_checkpoint"):
+                lines.extend(["Loaded checkpoint:", ""])
+                lines.extend(["```json"])
+                lines.append(json.dumps(source_scan["loaded_checkpoint"], indent=2, sort_keys=True))
+                lines.extend(["```", ""])
 
     if payload.get("kubernetes_status"):
         lines.extend(["## Kubernetes Status Payload", "", "```json"])

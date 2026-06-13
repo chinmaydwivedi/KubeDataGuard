@@ -244,12 +244,17 @@ def run_check(settings: Settings, args: argparse.Namespace):
         compare_fields=parse_compare_fields(getattr(args, "compare_fields", "")),
         source_scan_page_size=getattr(args, "source_scan_page_size", 1000),
         source_resume_after_key=getattr(args, "source_resume_after_key", ""),
+        source_checkpoint_id=getattr(args, "source_checkpoint_id", ""),
+        source_reset_checkpoint=getattr(args, "source_reset_checkpoint", False),
+        source_max_pages=getattr(args, "source_max_pages", 0),
+        check_id=getattr(args, "check_id", ""),
     )
 
     payload = report.to_dict()
     print(json.dumps(payload, indent=2, sort_keys=True))
     if args.write_report:
         artifacts = write_report_artifacts(settings, report)
+        update_scan_checkpoint_report_ref(settings, payload, artifacts.report_ref)
         print(f"wrote {artifacts.json_path}")
         print(f"wrote {artifacts.markdown_path}")
         print(f"report ref {artifacts.report_ref}")
@@ -272,10 +277,15 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
         compare_fields=parse_compare_fields(args.compare_fields),
         source_scan_page_size=args.source_scan_page_size,
         source_resume_after_key=args.source_resume_after_key,
+        source_checkpoint_id=args.source_checkpoint_id,
+        source_reset_checkpoint=args.source_reset_checkpoint,
+        source_max_pages=args.source_max_pages,
+        check_id=args.check_id,
     )
 
     payload = report.to_dict()
     artifacts = write_report_artifacts(settings, report)
+    update_scan_checkpoint_report_ref(settings, payload, artifacts.report_ref)
     status = report.kubernetes_status(report_ref=artifacts.report_ref)
     status["observedGeneration"] = args.observed_generation
     if args.check_id:
@@ -311,6 +321,9 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
             compare_fields=parse_compare_fields(args.compare_fields),
             source_scan_page_size=args.source_scan_page_size,
             source_resume_after_key=args.source_resume_after_key,
+            source_checkpoint_id=args.source_checkpoint_id,
+            source_reset_checkpoint=args.source_reset_checkpoint,
+            source_max_pages=args.source_max_pages,
         )
         print("post-repair verification:")
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -341,10 +354,15 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
         compare_fields=parse_compare_fields(args.compare_fields),
         source_scan_page_size=args.source_scan_page_size,
         source_resume_after_key=args.source_resume_after_key,
+        source_checkpoint_id=args.source_checkpoint_id,
+        source_reset_checkpoint=args.source_reset_checkpoint,
+        source_max_pages=args.source_max_pages,
+        check_id=args.check_id,
     )
 
     verification_payload = verification.to_dict()
     artifacts = write_report_artifacts(settings, verification)
+    update_scan_checkpoint_report_ref(settings, verification_payload, artifacts.report_ref)
     payload, status = build_repair_job_result(
         invariant_name=args.invariant_name,
         source_report_ref=source_report_ref,
@@ -372,6 +390,9 @@ def add_query_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--compare-fields", default="")
     parser.add_argument("--source-scan-page-size", type=int, default=1000)
     parser.add_argument("--source-resume-after-key", default="")
+    parser.add_argument("--source-checkpoint-id", default="")
+    parser.add_argument("--source-reset-checkpoint", action="store_true")
+    parser.add_argument("--source-max-pages", type=int, default=0)
 
 
 def parse_compare_fields(raw: str) -> list[str]:
@@ -391,6 +412,10 @@ def check_invariant(
     compare_fields: list[str] | None = None,
     source_scan_page_size: int = 1000,
     source_resume_after_key: str = "",
+    source_checkpoint_id: str = "",
+    source_reset_checkpoint: bool = False,
+    source_max_pages: int = 0,
+    check_id: str = "",
 ):
     if invariant == "existence":
         return checker.check_paid_orders_indexed(
@@ -422,8 +447,22 @@ def check_invariant(
             max_lag_seconds=max_lag_seconds,
             source_scan_page_size=source_scan_page_size,
             source_resume_after_key=source_resume_after_key or None,
+            source_checkpoint_id=source_checkpoint_id,
+            source_reset_checkpoint=source_reset_checkpoint,
+            source_max_pages=source_max_pages,
+            check_id=check_id,
         )
     raise SystemExit(f"unknown invariant: {invariant}")
+
+
+def update_scan_checkpoint_report_ref(settings: Settings, payload: dict, report_ref: str) -> None:
+    source_scan = (payload.get("observation_window") or {}).get("source_scan") or {}
+    checkpoint_id = source_scan.get("checkpoint_id")
+    if not checkpoint_id:
+        return
+    from . import checkpoints
+
+    checkpoints.update_checkpoint_report_ref(settings, str(checkpoint_id), report_ref)
 
 
 def build_repair_job_result(

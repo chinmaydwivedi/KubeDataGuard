@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .config import Settings
 
@@ -264,6 +264,8 @@ def execute_source_query_keyset(
     key_field: str,
     page_size: int = DEFAULT_SOURCE_SCAN_PAGE_SIZE,
     resume_after_key: Any | None = None,
+    max_pages: int = 0,
+    on_page: Callable[[dict[str, Any]], None] | None = None,
 ) -> QueryScanResult:
     if not query.strip():
         raise ValueError("source query is required")
@@ -276,9 +278,17 @@ def execute_source_query_keyset(
     last_key: Any | None = resume_after_key or None
     first_key_text: str | None = None
     last_key_text: str | None = str(resume_after_key) if resume_after_key else None
+    source_watermark: str | None = None
+    completed = True
+    stop_reason = "exhausted"
 
     with connect(settings) as conn:
         while True:
+            if max_pages > 0 and pages >= max_pages:
+                completed = False
+                stop_reason = "max_pages"
+                break
+
             params: tuple[Any, ...]
             if last_key is None:
                 paged_query = f"""
@@ -315,25 +325,71 @@ def execute_source_query_keyset(
                     first_key_text = raw_key_text
                 last_key = raw_key
                 last_key_text = raw_key_text
-                rows.append(serialize_query_row(row))
+                serialized = serialize_query_row(row)
+                rows.append(serialized)
+            source_watermark = latest_query_watermark(rows)
+            if on_page is not None:
+                on_page(
+                    query_scan_evidence(
+                        key_field=key_field,
+                        page_size=page_size,
+                        pages=pages,
+                        rows=len(rows),
+                        first_key=first_key_text,
+                        last_key=last_key_text,
+                        resume_after_key=resume_after_key,
+                        source_watermark=source_watermark,
+                        completed=False,
+                        stop_reason="page",
+                    )
+                )
 
             if len(page) < page_size:
                 break
 
     return QueryScanResult(
         rows=rows,
-        evidence={
-            "mode": "keyset",
-            "key_field": key_field,
-            "page_size": page_size,
-            "pages": pages,
-            "rows": len(rows),
-            "first_key": first_key_text,
-            "last_key": last_key_text,
-            "resume_after_key": str(resume_after_key) if resume_after_key else None,
-            "completed": True,
-        },
+        evidence=query_scan_evidence(
+            key_field=key_field,
+            page_size=page_size,
+            pages=pages,
+            rows=len(rows),
+            first_key=first_key_text,
+            last_key=last_key_text,
+            resume_after_key=resume_after_key,
+            source_watermark=source_watermark,
+            completed=completed,
+            stop_reason=stop_reason,
+        ),
     )
+
+
+def query_scan_evidence(
+    *,
+    key_field: str,
+    page_size: int,
+    pages: int,
+    rows: int,
+    first_key: str | None,
+    last_key: str | None,
+    resume_after_key: Any | None,
+    source_watermark: str | None,
+    completed: bool,
+    stop_reason: str,
+) -> dict[str, Any]:
+    return {
+        "mode": "keyset",
+        "key_field": key_field,
+        "page_size": page_size,
+        "pages": pages,
+        "rows": rows,
+        "first_key": first_key,
+        "last_key": last_key,
+        "resume_after_key": str(resume_after_key) if resume_after_key else None,
+        "source_watermark": source_watermark,
+        "completed": completed,
+        "stop_reason": stop_reason,
+    }
 
 
 def bounded_source_scan_page_size(value: Any) -> int:
@@ -361,6 +417,13 @@ def quote_identifier(identifier: str) -> str:
     if identifier[0].isdigit():
         raise ValueError(f"unsupported identifier {identifier!r}; identifiers cannot start with a digit")
     return '"' + identifier.replace('"', '""') + '"'
+
+
+def latest_query_watermark(rows: list[dict[str, Any]]) -> str | None:
+    values = [str(row["updated_at"]) for row in rows if row.get("updated_at")]
+    if not values:
+        return None
+    return max(values)
 
 
 def set_orders_updated_at(
