@@ -44,11 +44,22 @@ spec:
                   type: string
                 type:
                   type: string
-                  enum: ["existence", "fieldEquality", "count", "checksum", "freshness", "aggregate"]
+                  enum: ["existence", "fieldEquality", "count", "checksum", "freshness", "aggregate", "query"]
+                checkIntervalSeconds:
+                  type: integer
+                  minimum: 0
+                  default: 0
                 maxLagSeconds:
                   type: integer
                   minimum: 0
                   default: 60
+                keyField:
+                  type: string
+                  default: id
+                compareFields:
+                  type: array
+                  items:
+                    type: string
                 sourceQuery:
                   type: string
                 targetQuery:
@@ -105,4 +116,10 @@ spec:
                   type: string
                 observedGeneration:
                   type: integer
+                checkID:
+                  type: string
+                checkIntervalSeconds:
+                  type: integer
+                nextCheckAfter:
+                  type: string
               x-kubernetes-preserve-unknown-fields: true

@@ -71,9 +71,17 @@ The controller supports two modes:
 - default synthetic mode for smoke testing status patches
 - job-backed mode with `dataguard.io/checker-mode=job`
 
-In job-backed mode, the operator creates a Kubernetes Job for each `Invariant` generation. The Job runs the Python checker, writes `report.json` and `status.json` into a ConfigMap, and the operator patches `Invariant.status` from `status.json`.
+In job-backed mode, the operator creates Kubernetes Jobs for each `Invariant` generation or scheduled `checkIntervalSeconds` slot. The Job runs the Python checker, writes the full report to the worker report store, writes compact `status.json` and `repair-input.json` into a ConfigMap, and the operator patches `Invariant.status` from `status.json`.
 
-If that status is `DriftDetected` and an auto-approved `RepairPolicy` exists, the operator creates a repair Job for the same generation. The repair Job reads the checker report ConfigMap, reindexes missing/stale records from Postgres into OpenSearch, verifies the invariant, writes a repair report ConfigMap, and the operator patches `Invariant.status` from the repair result.
+If that status is `DriftDetected` and an auto-approved `RepairPolicy` exists, the operator creates a repair Job for the same check ID. The repair Job reads compact repair input from the checker ConfigMap, reindexes missing/stale records from Postgres into OpenSearch, verifies the invariant, writes a repair status ConfigMap, and the operator patches `Invariant.status` from the repair result.
+
+Build and run the operator in-cluster:
+
+```sh
+make operator-image
+kind load docker-image kubedataguard-operator:latest --name kubedataguard
+kubectl apply -f k8s/operator.yaml
+```
 
 Synthetic drift annotation:
 
@@ -150,9 +158,12 @@ Useful inspection commands:
 ```sh
 kubectl get invariant -o wide
 kubectl get jobs,pods,configmaps -l app.kubernetes.io/name=kubedataguard -o wide
-kubectl get configmap dataguard-report-paid-orders-indexed-g1 -o jsonpath='{.data.status\.json}'
-kubectl get configmap dataguard-repair-report-paid-orders-indexed-g1 -o jsonpath='{.data.status\.json}'
+kubectl get configmaps -l app.kubernetes.io/name=kubedataguard
+kubectl get configmap <report-configmap-name> -o jsonpath='{.data.status\.json}'
+kubectl get configmap <repair-configmap-name> -o jsonpath='{.data.status\.json}'
 ```
+
+For scheduled checks, names include a time-slot check ID such as `g3-t29493510` instead of only `g3`.
 
 To force a new checker generation after creating drift:
 

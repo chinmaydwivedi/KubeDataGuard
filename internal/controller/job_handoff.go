@@ -47,22 +47,33 @@ const (
 	DefaultReportDir             = "/tmp/dataguard-reports"
 )
 
+type CheckRun struct {
+	ID              string
+	IntervalSeconds int64
+	NextRequeue     time.Duration
+	Scheduled        bool
+}
+
 func (r *InvariantReconciler) reconcileJobBackedInvariant(
 	ctx context.Context,
 	req ctrl.Request,
 	invariant *unstructured.Unstructured,
 ) (ctrl.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-	configMapName := reportConfigMapName(invariant)
-	repairMapName := repairConfigMapName(invariant)
+	run, err := currentCheckRun(invariant, r.clock().Now())
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	configMapName := reportConfigMapName(invariant, run.ID)
+	repairMapName := repairConfigMapName(invariant, run.ID)
 
-	repairStatus, repairFound, err := r.statusFromReportConfigMap(ctx, invariant, repairMapName)
+	repairStatus, repairFound, err := r.statusFromReportConfigMap(ctx, invariant, repairMapName, run)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if repairFound {
 		if reportStatusAlreadyApplied(invariant, repairStatus) {
-			return ctrl.Result{}, nil
+			return requeueForRun(run), nil
 		}
 		if err := r.patchInvariantStatus(ctx, invariant, repairStatus); err != nil {
 			return ctrl.Result{}, err
@@ -74,22 +85,22 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 			"driftCount", repairStatus["driftCount"],
 			"reportRef", repairStatus["reportRef"],
 		)
-		return ctrl.Result{}, nil
+		return requeueForRun(run), nil
 	}
 
-	status, found, err := r.statusFromReportConfigMap(ctx, invariant, configMapName)
+	status, found, err := r.statusFromReportConfigMap(ctx, invariant, configMapName, run)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if found {
 		if phase, _ := stringField(status, "phase"); phase == PhaseDriftDetected {
-			result, handled, err := r.reconcileRepairForDrift(ctx, req, invariant, status, configMapName)
+			result, handled, err := r.reconcileRepairForDrift(ctx, req, invariant, status, configMapName, run)
 			if err != nil || handled {
 				return result, err
 			}
 		}
 		if reportStatusAlreadyApplied(invariant, status) {
-			return ctrl.Result{}, nil
+			return requeueForRun(run), nil
 		}
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, err
@@ -101,7 +112,7 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 			"driftCount", status["driftCount"],
 			"reportRef", status["reportRef"],
 		)
-		return ctrl.Result{}, nil
+		return requeueForRun(run), nil
 	}
 
 	serviceAccountName := checkerServiceAccountName(invariant)
@@ -109,18 +120,18 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 		return ctrl.Result{}, err
 	}
 
-	jobName := checkerJobName(invariant)
+	jobName := checkerJobName(invariant, run.ID)
 	job := &batchv1.Job{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: invariant.GetNamespace(), Name: jobName}, job)
 	if apierrors.IsNotFound(err) {
-		job, err := BuildCheckerJob(invariant)
+		job, err := BuildCheckerJob(invariant, run)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.Create(ctx, job); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.patchInvariantStatus(ctx, invariant, BuildJobRunningStatus(invariant, r.clock().Now(), jobName)); err != nil {
+		if err := r.patchInvariantStatus(ctx, invariant, BuildJobRunningStatus(invariant, r.clock().Now(), jobName, run)); err != nil {
 			return ctrl.Result{}, err
 		}
 		log.Info(
@@ -136,22 +147,22 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 	}
 
 	if jobFailed(job) {
-		status := BuildJobFailedStatus(invariant, r.clock().Now(), jobName, "checker job failed before publishing a valid status report")
+		status := BuildJobFailedStatus(invariant, r.clock().Now(), jobName, run, "checker job failed before publishing a valid status report")
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, nil
+		return requeueForRun(run), nil
 	}
 
 	if jobComplete(job) {
-		status := BuildJobFailedStatus(invariant, r.clock().Now(), jobName, "checker job completed without publishing a valid status report")
+		status := BuildJobFailedStatus(invariant, r.clock().Now(), jobName, run, "checker job completed without publishing a valid status report")
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, nil
+		return requeueForRun(run), nil
 	}
 
-	if err := r.patchInvariantStatus(ctx, invariant, BuildJobRunningStatus(invariant, r.clock().Now(), jobName)); err != nil {
+	if err := r.patchInvariantStatus(ctx, invariant, BuildJobRunningStatus(invariant, r.clock().Now(), jobName, run)); err != nil {
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -161,6 +172,7 @@ func (r *InvariantReconciler) statusFromReportConfigMap(
 	ctx context.Context,
 	invariant *unstructured.Unstructured,
 	name string,
+	run CheckRun,
 ) (map[string]any, bool, error) {
 	configMap := &corev1.ConfigMap{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: invariant.GetNamespace(), Name: name}, configMap)
@@ -183,6 +195,13 @@ func (r *InvariantReconciler) statusFromReportConfigMap(
 	if !ok || observedGeneration != invariant.GetGeneration() {
 		return nil, false, nil
 	}
+	if run.ID != "" {
+		observedCheckID, ok := stringField(status, "checkID")
+		if !ok || observedCheckID != run.ID {
+			return nil, false, nil
+		}
+	}
+	enrichScheduledStatus(status, r.clock().Now(), run)
 	return status, true, nil
 }
 
@@ -192,6 +211,7 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 	invariant *unstructured.Unstructured,
 	driftStatus map[string]any,
 	checkReportConfigMapName string,
+	run CheckRun,
 ) (ctrl.Result, bool, error) {
 	log := ctrl.LoggerFrom(ctx)
 	policy, found, err := r.findAutoRepairPolicy(ctx, invariant)
@@ -207,19 +227,19 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 		return ctrl.Result{}, true, err
 	}
 
-	jobName := repairJobName(invariant)
+	jobName := repairJobName(invariant, run.ID)
 	job := &batchv1.Job{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: invariant.GetNamespace(), Name: jobName}, job)
 	driftCount, _ := int64Field(driftStatus, "driftCount")
 	if apierrors.IsNotFound(err) {
-		job, err := BuildRepairJob(invariant, checkReportConfigMapName)
+		job, err := BuildRepairJob(invariant, checkReportConfigMapName, run)
 		if err != nil {
 			return ctrl.Result{}, true, err
 		}
 		if err := r.Create(ctx, job); err != nil {
 			return ctrl.Result{}, true, err
 		}
-		status := BuildRepairRunningStatus(invariant, r.clock().Now(), jobName, driftCount)
+		status := BuildRepairRunningStatus(invariant, r.clock().Now(), jobName, run, driftCount)
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, true, err
 		}
@@ -229,7 +249,7 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 			"repairPolicy", policy.GetName(),
 			"job", jobName,
 			"sourceReportConfigMap", checkReportConfigMapName,
-			"repairConfigMap", repairConfigMapName(invariant),
+			"repairConfigMap", repairConfigMapName(invariant, run.ID),
 		)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, true, nil
 	}
@@ -238,7 +258,7 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 	}
 
 	if jobFailed(job) {
-		status := BuildRepairFailedStatus(invariant, r.clock().Now(), jobName, driftCount, "repair job failed before publishing a valid status report")
+		status := BuildRepairFailedStatus(invariant, r.clock().Now(), jobName, run, driftCount, "repair job failed before publishing a valid status report")
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, true, err
 		}
@@ -246,14 +266,14 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 	}
 
 	if jobComplete(job) {
-		status := BuildRepairFailedStatus(invariant, r.clock().Now(), jobName, driftCount, "repair job completed without publishing a valid status report")
+		status := BuildRepairFailedStatus(invariant, r.clock().Now(), jobName, run, driftCount, "repair job completed without publishing a valid status report")
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, true, err
 		}
 		return ctrl.Result{}, true, nil
 	}
 
-	status := BuildRepairRunningStatus(invariant, r.clock().Now(), jobName, driftCount)
+	status := BuildRepairRunningStatus(invariant, r.clock().Now(), jobName, run, driftCount)
 	if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 		return ctrl.Result{}, true, err
 	}
@@ -319,17 +339,28 @@ func repairPolicyAllowsAutoReindex(policy *unstructured.Unstructured) (bool, err
 	return false, nil
 }
 
-func BuildCheckerJob(invariant *unstructured.Unstructured) (*batchv1.Job, error) {
+func BuildCheckerJob(invariant *unstructured.Unstructured, run CheckRun) (*batchv1.Job, error) {
 	maxLagSeconds, err := maxLagSeconds(invariant)
 	if err != nil {
 		return nil, err
 	}
 
-	jobName := checkerJobName(invariant)
-	configMapName := reportConfigMapName(invariant)
+	jobName := checkerJobName(invariant, run.ID)
+	configMapName := reportConfigMapName(invariant, run.ID)
 	serviceAccountName := checkerServiceAccountName(invariant)
 	backoffLimit := int32(0)
 	ttlSeconds := int32(600)
+	args := []string{
+		"check-job",
+		"--invariant", checkerInvariantArg(invariant),
+		"--max-lag-seconds", strconv.FormatInt(maxLagSeconds, 10),
+		"--namespace", invariant.GetNamespace(),
+		"--config-map", configMapName,
+		"--invariant-name", invariant.GetName(),
+		"--observed-generation", strconv.FormatInt(invariant.GetGeneration(), 10),
+		"--check-id", run.ID,
+	}
+	args = appendQueryArgs(args, invariant)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -353,15 +384,7 @@ func BuildCheckerJob(invariant *unstructured.Unstructured) (*batchv1.Job, error)
 							Name:            "checker",
 							Image:           annotationOrDefault(invariant, AnnotationCheckerImage, DefaultCheckerImage),
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args: []string{
-								"check-job",
-								"--invariant", checkerInvariantArg(invariant),
-								"--max-lag-seconds", strconv.FormatInt(maxLagSeconds, 10),
-								"--namespace", invariant.GetNamespace(),
-								"--config-map", configMapName,
-								"--invariant-name", invariant.GetName(),
-								"--observed-generation", strconv.FormatInt(invariant.GetGeneration(), 10),
-							},
+							Args:            args,
 							Env: checkerEnv(invariant),
 						},
 					},
@@ -371,17 +394,29 @@ func BuildCheckerJob(invariant *unstructured.Unstructured) (*batchv1.Job, error)
 	}, nil
 }
 
-func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapName string) (*batchv1.Job, error) {
+func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapName string, run CheckRun) (*batchv1.Job, error) {
 	maxLagSeconds, err := maxLagSeconds(invariant)
 	if err != nil {
 		return nil, err
 	}
 
-	jobName := repairJobName(invariant)
-	configMapName := repairConfigMapName(invariant)
+	jobName := repairJobName(invariant, run.ID)
+	configMapName := repairConfigMapName(invariant, run.ID)
 	serviceAccountName := repairServiceAccountName(invariant)
 	backoffLimit := int32(0)
 	ttlSeconds := int32(600)
+	args := []string{
+		"repair-job",
+		"--namespace", invariant.GetNamespace(),
+		"--report-config-map", sourceReportConfigMapName,
+		"--config-map", configMapName,
+		"--invariant-name", invariant.GetName(),
+		"--observed-generation", strconv.FormatInt(invariant.GetGeneration(), 10),
+		"--check-id", run.ID,
+		"--max-lag-seconds", strconv.FormatInt(maxLagSeconds, 10),
+		"--verify-invariant", checkerInvariantArg(invariant),
+	}
+	args = appendQueryArgs(args, invariant)
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -405,16 +440,7 @@ func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapN
 							Name:            "repair",
 							Image:           repairImage(invariant),
 							ImagePullPolicy: corev1.PullIfNotPresent,
-							Args: []string{
-								"repair-job",
-								"--namespace", invariant.GetNamespace(),
-								"--report-config-map", sourceReportConfigMapName,
-								"--config-map", configMapName,
-								"--invariant-name", invariant.GetName(),
-								"--observed-generation", strconv.FormatInt(invariant.GetGeneration(), 10),
-								"--max-lag-seconds", strconv.FormatInt(maxLagSeconds, 10),
-								"--verify-invariant", checkerInvariantArg(invariant),
-							},
+							Args:            args,
 							Env: checkerEnv(invariant),
 						},
 					},
@@ -424,8 +450,8 @@ func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapN
 	}, nil
 }
 
-func BuildJobRunningStatus(invariant *unstructured.Unstructured, now time.Time, jobName string) map[string]any {
-	return jobLifecycleStatus(invariant, now, map[string]any{
+func BuildJobRunningStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, run CheckRun) map[string]any {
+	return jobLifecycleStatus(invariant, now, run, map[string]any{
 		"healthy":             false,
 		"phase":               PhaseUnknown,
 		"checkStatus":         CheckPartial,
@@ -435,8 +461,8 @@ func BuildJobRunningStatus(invariant *unstructured.Unstructured, now time.Time, 
 	})
 }
 
-func BuildJobFailedStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, reason string) map[string]any {
-	return jobLifecycleStatus(invariant, now, map[string]any{
+func BuildJobFailedStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, run CheckRun, reason string) map[string]any {
+	return jobLifecycleStatus(invariant, now, run, map[string]any{
 		"healthy":             false,
 		"phase":               PhaseCheckFailed,
 		"checkStatus":         CheckFailed,
@@ -447,8 +473,8 @@ func BuildJobFailedStatus(invariant *unstructured.Unstructured, now time.Time, j
 	})
 }
 
-func BuildRepairRunningStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, driftCount int64) map[string]any {
-	return jobLifecycleStatus(invariant, now, map[string]any{
+func BuildRepairRunningStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, run CheckRun, driftCount int64) map[string]any {
+	return jobLifecycleStatus(invariant, now, run, map[string]any{
 		"healthy":             false,
 		"phase":               PhaseRepairing,
 		"checkStatus":         CheckPartial,
@@ -458,8 +484,8 @@ func BuildRepairRunningStatus(invariant *unstructured.Unstructured, now time.Tim
 	})
 }
 
-func BuildRepairFailedStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, driftCount int64, reason string) map[string]any {
-	return jobLifecycleStatus(invariant, now, map[string]any{
+func BuildRepairFailedStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, run CheckRun, driftCount int64, reason string) map[string]any {
+	return jobLifecycleStatus(invariant, now, run, map[string]any{
 		"healthy":             false,
 		"phase":               PhaseRepairFailed,
 		"checkStatus":         CheckFailed,
@@ -470,7 +496,7 @@ func BuildRepairFailedStatus(invariant *unstructured.Unstructured, now time.Time
 	})
 }
 
-func jobLifecycleStatus(invariant *unstructured.Unstructured, now time.Time, base map[string]any) map[string]any {
+func jobLifecycleStatus(invariant *unstructured.Unstructured, now time.Time, run CheckRun, base map[string]any) map[string]any {
 	maxLag, err := maxLagSeconds(invariant)
 	if err != nil {
 		maxLag = 60
@@ -488,6 +514,11 @@ func jobLifecycleStatus(invariant *unstructured.Unstructured, now time.Time, bas
 		"completeness":          base["checkStatus"],
 	}
 	base["observedGeneration"] = invariant.GetGeneration()
+	base["checkID"] = run.ID
+	if run.Scheduled {
+		base["checkIntervalSeconds"] = run.IntervalSeconds
+		base["nextCheckAfter"] = checkedAt.Add(run.NextRequeue).Format(time.RFC3339)
+	}
 	return base
 }
 
@@ -633,6 +664,7 @@ func reportStatusAlreadyApplied(invariant *unstructured.Unstructured, desired ma
 		"counterexampleCount",
 		"checkedRecords",
 		"observedGeneration",
+		"checkIntervalSeconds",
 	} {
 		currentValue, currentOK := int64Field(current, key)
 		desiredValue, desiredOK := int64Field(desired, key)
@@ -641,7 +673,7 @@ func reportStatusAlreadyApplied(invariant *unstructured.Unstructured, desired ma
 		}
 	}
 
-	for _, key := range []string{"phase", "checkStatus", "guarantee", "reportRef"} {
+	for _, key := range []string{"phase", "checkStatus", "guarantee", "reportRef", "checkID"} {
 		currentValue, currentOK := stringField(current, key)
 		desiredValue, desiredOK := stringField(desired, key)
 		if currentOK != desiredOK || currentValue != desiredValue {
@@ -667,6 +699,8 @@ func checkerEnv(invariant *unstructured.Unstructured) []corev1.EnvVar {
 
 func checkerInvariantArg(invariant *unstructured.Unstructured) string {
 	switch invariantType(invariant) {
+	case "query":
+		return "query"
 	case "aggregate":
 		return "aggregate"
 	case "freshness":
@@ -674,6 +708,23 @@ func checkerInvariantArg(invariant *unstructured.Unstructured) string {
 	default:
 		return "existence"
 	}
+}
+
+func appendQueryArgs(args []string, invariant *unstructured.Unstructured) []string {
+	if checkerInvariantArg(invariant) != "query" {
+		return args
+	}
+	args = append(args, "--key-field", keyField(invariant))
+	if fields := compareFields(invariant); fields != "" {
+		args = append(args, "--compare-fields", fields)
+	}
+	if query := sourceQuery(invariant); query != "" {
+		args = append(args, "--source-query", query)
+	}
+	if query := targetQuery(invariant); query != "" {
+		args = append(args, "--target-query", query)
+	}
+	return args
 }
 
 func checkerServiceAccountName(invariant *unstructured.Unstructured) string {
@@ -716,6 +767,75 @@ func invariantType(invariant *unstructured.Unstructured) string {
 	return invariantType
 }
 
+func sourceQuery(invariant *unstructured.Unstructured) string {
+	value, _, _ := unstructured.NestedString(invariant.Object, "spec", "sourceQuery")
+	return value
+}
+
+func targetQuery(invariant *unstructured.Unstructured) string {
+	value, _, _ := unstructured.NestedString(invariant.Object, "spec", "targetQuery")
+	return value
+}
+
+func keyField(invariant *unstructured.Unstructured) string {
+	value, found, _ := unstructured.NestedString(invariant.Object, "spec", "keyField")
+	if !found || value == "" {
+		return "id"
+	}
+	return value
+}
+
+func compareFields(invariant *unstructured.Unstructured) string {
+	values, found, _ := unstructured.NestedStringSlice(invariant.Object, "spec", "compareFields")
+	if !found || len(values) == 0 {
+		return ""
+	}
+	return strings.Join(values, ",")
+}
+
+func currentCheckRun(invariant *unstructured.Unstructured, now time.Time) (CheckRun, error) {
+	intervalSeconds, found, err := unstructured.NestedInt64(invariant.Object, "spec", "checkIntervalSeconds")
+	if err != nil {
+		return CheckRun{}, fmt.Errorf("read spec.checkIntervalSeconds: %w", err)
+	}
+	if !found || intervalSeconds <= 0 {
+		return CheckRun{
+			ID: fmt.Sprintf("g%d", invariant.GetGeneration()),
+		}, nil
+	}
+
+	slot := now.UTC().Unix() / intervalSeconds
+	nextUnix := (slot + 1) * intervalSeconds
+	next := time.Duration(nextUnix-now.UTC().Unix()) * time.Second
+	if next <= 0 {
+		next = time.Duration(intervalSeconds) * time.Second
+	}
+	return CheckRun{
+		ID:              fmt.Sprintf("g%d-t%d", invariant.GetGeneration(), slot),
+		IntervalSeconds: intervalSeconds,
+		NextRequeue:     next,
+		Scheduled:        true,
+	}, nil
+}
+
+func requeueForRun(run CheckRun) ctrl.Result {
+	if !run.Scheduled {
+		return ctrl.Result{}
+	}
+	return ctrl.Result{RequeueAfter: run.NextRequeue}
+}
+
+func enrichScheduledStatus(status map[string]any, now time.Time, run CheckRun) {
+	if run.ID != "" {
+		status["checkID"] = run.ID
+	}
+	if !run.Scheduled {
+		return
+	}
+	status["checkIntervalSeconds"] = run.IntervalSeconds
+	status["nextCheckAfter"] = now.UTC().Add(run.NextRequeue).Format(time.RFC3339)
+}
+
 func checkerLabels(invariant *unstructured.Unstructured) map[string]string {
 	return map[string]string{
 		"app.kubernetes.io/name": "kubedataguard",
@@ -745,20 +865,20 @@ func invariantOwnerReferences(invariant *unstructured.Unstructured) []metav1.Own
 	}
 }
 
-func checkerJobName(invariant *unstructured.Unstructured) string {
-	return dnsLabel("dataguard-check", fmt.Sprintf("%s-g%d", invariant.GetName(), invariant.GetGeneration()))
+func checkerJobName(invariant *unstructured.Unstructured, checkID string) string {
+	return dnsLabel("dataguard-check", fmt.Sprintf("%s-%s", invariant.GetName(), checkID))
 }
 
-func reportConfigMapName(invariant *unstructured.Unstructured) string {
-	return dnsLabel("dataguard-report", fmt.Sprintf("%s-g%d", invariant.GetName(), invariant.GetGeneration()))
+func reportConfigMapName(invariant *unstructured.Unstructured, checkID string) string {
+	return dnsLabel("dataguard-report", fmt.Sprintf("%s-%s", invariant.GetName(), checkID))
 }
 
-func repairJobName(invariant *unstructured.Unstructured) string {
-	return dnsLabel("dataguard-repair", fmt.Sprintf("%s-g%d", invariant.GetName(), invariant.GetGeneration()))
+func repairJobName(invariant *unstructured.Unstructured, checkID string) string {
+	return dnsLabel("dataguard-repair", fmt.Sprintf("%s-%s", invariant.GetName(), checkID))
 }
 
-func repairConfigMapName(invariant *unstructured.Unstructured) string {
-	return dnsLabel("dataguard-repair-report", fmt.Sprintf("%s-g%d", invariant.GetName(), invariant.GetGeneration()))
+func repairConfigMapName(invariant *unstructured.Unstructured, checkID string) string {
+	return dnsLabel("dataguard-repair-report", fmt.Sprintf("%s-%s", invariant.GetName(), checkID))
 }
 
 func dnsLabel(prefix string, value string) string {

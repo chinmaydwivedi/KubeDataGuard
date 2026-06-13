@@ -265,6 +265,119 @@ def compare_order_fields(
     return mismatches
 
 
+def compare_query_results(
+    *,
+    invariant_name: str,
+    source_rows: list[dict[str, Any]],
+    target_rows: list[dict[str, Any]],
+    key_field: str,
+    compare_fields: list[str],
+    guarantee: str,
+    max_lag_seconds: int = 60,
+    checked_at: datetime | None = None,
+    target_read_at: datetime | None = None,
+    stream_topic: str | None = None,
+    stream_offset_start: int | None = None,
+    stream_offset_end: int | None = None,
+    source_lsn: str | None = None,
+) -> DriftReport:
+    target_by_key = {
+        str(row[key_field]): row
+        for row in target_rows
+        if row.get(key_field) is not None
+    }
+    missing: list[dict[str, Any]] = []
+    stale: list[dict[str, Any]] = []
+
+    for source in source_rows:
+        if source.get(key_field) is None:
+            stale.append(
+                {
+                    "order_id": None,
+                    "reason": f"source row is missing key field {key_field}",
+                    "mismatches": [
+                        {
+                            "field": key_field,
+                            "source": None,
+                            "target": None,
+                        }
+                    ],
+                    "source": source,
+                    "target": {},
+                }
+            )
+            continue
+
+        row_key = str(source[key_field])
+        target = target_by_key.get(row_key)
+        if target is None:
+            missing.append(
+                {
+                    "order_id": row_key,
+                    "reason": "source row is absent from the target query result",
+                    "source": source,
+                }
+            )
+            continue
+
+        mismatches = compare_named_fields(source, target, compare_fields)
+        if mismatches:
+            stale.append(
+                {
+                    "order_id": row_key,
+                    "reason": "target row differs from source row",
+                    "mismatches": mismatches,
+                    "source": source,
+                    "target": target,
+                }
+            )
+
+    return DriftReport(
+        invariant=invariant_name,
+        checked_records=len(source_rows),
+        missing=missing,
+        stale=stale,
+        guarantee=guarantee,
+        observation_window=build_observation_window(
+            source_rows,
+            max_lag_seconds=max_lag_seconds,
+            checked_at=checked_at,
+            target_read_at=target_read_at,
+            stream_topic=stream_topic,
+            stream_offset_start=stream_offset_start,
+            stream_offset_end=stream_offset_end,
+            source_watermark=latest_source_watermark(source_rows),
+            source_lsn=source_lsn,
+        ),
+    )
+
+
+def compare_named_fields(
+    source: dict[str, Any],
+    target: dict[str, Any],
+    fields: list[str],
+) -> list[dict[str, Any]]:
+    mismatches: list[dict[str, Any]] = []
+    for field_name in fields:
+        source_value = comparable_value(source.get(field_name))
+        target_value = comparable_value(target.get(field_name))
+        if source_value != target_value:
+            mismatches.append(
+                {
+                    "field": field_name,
+                    "source": source.get(field_name),
+                    "target": target.get(field_name),
+                }
+            )
+    return mismatches
+
+
+def comparable_value(value: Any) -> Any:
+    if value is None:
+        return None
+    return str(value)
+
+
 def summarize_paid_orders(orders: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "count": len(orders),

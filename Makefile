@@ -2,7 +2,7 @@ COMPOSE ?= docker compose
 PYTHON ?= python3
 APP = $(COMPOSE) run --rm dataguard
 
-.PHONY: up down reset init seed generate index drift drift-freshness check check-aggregate check-freshness repair repair-freshness demo-local demo-drift demo-freshness-drift demo-repair test operator-test operator-build
+.PHONY: up down reset init seed generate index drift drift-freshness check check-aggregate check-freshness repair repair-freshness demo-local demo-drift demo-freshness-drift demo-repair test operator-test operator-build operator-image
 
 up:
 	$(COMPOSE) up -d postgres redpanda-0 redpanda-console opensearch
@@ -74,3 +74,6 @@ operator-test:
 
 operator-build:
 	go build ./cmd/dataguard-operator
+
+operator-image:
+	docker build -f Dockerfile.operator -t kubedataguard-operator:latest .

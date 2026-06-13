@@ -2,7 +2,29 @@
 
 ## One-Line Idea
 
-KubeDataGuard is a Kubernetes operator that lets teams declare data consistency SLOs between source-of-truth systems and derived data stores, then continuously checks, explains, and repairs drift.
+KubeDataGuard is a Kubernetes-native data consistency SLO operator for checking, explaining, and repairing drift between source-of-truth systems and derived data stores.
+
+## Current Maturity
+
+This repository is a research-grade vertical-slice MVP, not a production-ready general-purpose data platform yet.
+
+What is implemented and verified:
+
+- Postgres -> Redpanda/Kafka -> OpenSearch demo pipeline.
+- Hardcoded commerce invariants for existence, aggregate consistency, and bounded freshness.
+- A first generic query invariant for Postgres source queries and OpenSearch JSON target queries.
+- A Go/controller-runtime operator that schedules checker and repair Jobs.
+- Compact Kubernetes status handoff through ConfigMaps.
+- Full JSON/Markdown reports written to the worker report store and referenced from status.
+- Source-of-truth reindex repair for missing/stale/freshness drift in the commerce demo.
+
+What is intentionally not solved yet:
+
+- Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
+- Large-scale DBLog-style chunked, resumable scans.
+- Production object-store report persistence such as S3/GCS/MinIO.
+- Kubernetes Secret-backed connection loading from `DataSource` resources.
+- General repair strategies such as Kafka replay, cache invalidation, and analytics backfill.
 
 ## Research-Informed Novelty Wedge
 
@@ -202,9 +224,10 @@ Current closed-loop operator path:
 - `internal/controller`: unstructured `Invariant` reconciler
 - watches `dataguard.io/v1alpha1` `Invariant` resources
 - supports `dataguard.io/checker-mode=job`
-- creates one checker Job per `Invariant` generation
+- creates checker Jobs per `Invariant` generation or scheduled check interval
 - runs the Python checker against Postgres, Redpanda/Kafka, and OpenSearch
-- stores `report.json` and `status.json` in a report ConfigMap
+- stores compact `status.json` and repair input in a report ConfigMap
+- writes full JSON/Markdown reports to the worker report store and keeps only the report reference in status
 - if drift is detected, finds an auto-approved `RepairPolicy`
 - creates a repair Job for allowed `reindex-records` repair
 - repair Job reindexes from Postgres into OpenSearch and verifies the invariant
@@ -262,11 +285,38 @@ metadata:
 spec:
   derivedViewRef: orders-search-index
   type: existence
+  checkIntervalSeconds: 300
   maxLagSeconds: 60
   sourceQuery: |
     select id from orders where status = 'paid'
   targetQuery: |
     select id from orders_search where status = 'paid'
+```
+
+The first executable generic query invariant is intentionally narrower:
+
+```yaml
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
+  name: paid-orders-query-check
+spec:
+  derivedViewRef: orders-search-index
+  type: query
+  checkIntervalSeconds: 300
+  maxLagSeconds: 60
+  keyField: id
+  compareFields:
+    - status
+    - amount_cents
+    - currency
+    - version
+  sourceQuery: |
+    select id, status, amount_cents, currency, version, updated_at
+    from orders
+    where status = 'paid'
+  targetQuery: |
+    {"query":{"term":{"status":"paid"}},"size":10000}
 ```
 
 ### RepairPolicy
@@ -314,10 +364,13 @@ The implemented checker loop today is:
 Invariant CRD
   |
   |-- Go operator sees dataguard.io/checker-mode=job
-  |-- creates dataguard-check-<invariant>-g<generation> Job
+  |-- computes checkID from generation or checkIntervalSeconds time slot
+  |-- creates dataguard-check-<invariant>-<checkID> Job
   |-- Python checker connects to Postgres, Redpanda/Kafka, and OpenSearch
-  |-- Python checker writes status.json and report.json into a ConfigMap
+  |-- Python checker writes full report to REPORT_DIR
+  |-- Python checker writes compact status.json and repair-input.json into a ConfigMap
   |-- Go operator copies status.json into Invariant.status
+  |-- Go operator requeues scheduled invariants for the next check interval
 ```
 
 This path has been runtime-verified on kind while the data systems run through Docker Compose.
@@ -403,6 +456,8 @@ Files:
 - `examples/commerce-consistency.yaml`: example declarative consistency policy
 - `cmd/dataguard-operator`: Go/controller-runtime operator entrypoint
 - `internal/controller`: synthetic and job-backed `Invariant` reconciliation
+- `Dockerfile.operator`: Go operator image
+- `k8s/operator.yaml`: in-cluster operator Deployment/RBAC sketch
 
 Implemented commands:
 
@@ -414,6 +469,7 @@ python -m dataguard.cli inject-freshness-drift
 python -m dataguard.cli check --invariant existence
 python -m dataguard.cli check --invariant aggregate
 python -m dataguard.cli check --invariant freshness
+python -m dataguard.cli check --invariant query --source-query "..." --target-query "..."
 python -m dataguard.cli check-job --invariant existence
 python -m dataguard.cli repair
 python -m dataguard.cli repair-job
@@ -562,6 +618,7 @@ Current report shape:
 - `guarantee`: the semantic claim being checked
 - `observation_window`: check time, target read time, max lag, eligible source boundary, source LSN, stream topic, and stream offset range
 - `kubernetes_status`: compact status payload used by the job-backed operator
+- `checkID`: generation or scheduled interval identifier used to make repeated checks idempotent
 - `counterexamples`: compact evidence for missing, stale, or aggregate-mismatch violations
 - `missing`, `stale`, `aggregate_mismatches`, and `freshness_violations`: detailed current drift classes
 - `freshness_breaches`: historical bounded-freshness SLO misses that are preserved as evidence but do not make the current state unrecoverably unhealthy
@@ -628,6 +685,7 @@ Expected behavior:
 ### Milestone 2: Report and Status Shape
 
 - Keep JSON/Markdown reports for local CLI
+- Keep ConfigMap handoff compact in Kubernetes: `status.json` plus repair input, not full report blobs
 - Define `Invariant.status` fields for Kubernetes:
   - `healthy`
   - `phase`
@@ -639,12 +697,16 @@ Expected behavior:
   - `counterexampleCount`
   - `reportRef`
   - `observedGeneration`
+  - `checkID`
+  - `checkIntervalSeconds`
+  - `nextCheckAfter`
 
 ### Milestone 3: More Invariant Types
 
 - Implemented aggregate checks: paid order count and revenue total
 - Implemented bounded freshness checks using source `updated_at`, target `indexed_at`, Postgres LSN, and Kafka offset evidence
 - Implemented freshness drift injection and freshness repair verification
+- Implemented first generic Postgres/OpenSearch query invariant path
 - Keep existence as the simplest invariant
 
 ### Milestone 4: Failure Taxonomy Tests
@@ -668,9 +730,11 @@ Expected behavior:
 - Implemented first controller-runtime skeleton
 - Implemented synthetic `Invariant` reconciliation
 - Implemented job-backed `Invariant` reconciliation
-- Implemented checker Job creation and ConfigMap report handoff
+- Implemented checker Job creation and compact ConfigMap status handoff
+- Implemented scheduled checker Jobs through `spec.checkIntervalSeconds`
 - Implemented repair Job creation from auto-approved `RepairPolicy`
 - Implemented repair result ConfigMap handoff and verified status update
+- Added operator Dockerfile and in-cluster Deployment/RBAC sketch
 - Enabled CRD `status` subresource
 - Update `.status` on `Invariant`
 - Run on kind/minikube
@@ -699,4 +763,3 @@ Expected behavior:
 - Human approval for high-risk repairs
 - Multi-tenant invariant isolation
 - "Explain drift" page that shows likely root cause
-

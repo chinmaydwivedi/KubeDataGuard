@@ -10,6 +10,7 @@ from .invariants import (
     compare_paid_order_aggregates,
     compare_paid_order_freshness,
     compare_paid_orders_to_index,
+    compare_query_results,
     iso,
 )
 
@@ -76,6 +77,45 @@ def check_paid_orders_freshness(
     return compare_paid_order_freshness(
         source_orders,
         indexed_orders,
+        max_lag_seconds=max_lag_seconds,
+        checked_at=checked_at,
+        target_read_at=datetime.now(timezone.utc),
+        stream_topic=settings.order_events_topic,
+        stream_offset_start=offsets["stream_offset_start"],
+        stream_offset_end=offsets["stream_offset_end"],
+        source_lsn=source_lsn,
+    )
+
+
+def check_query_invariant(
+    settings: Settings,
+    *,
+    invariant_name: str,
+    source_query: str,
+    target_query: str,
+    key_field: str,
+    compare_fields: list[str],
+    max_lag_seconds: int,
+) -> DriftReport:
+    checked_at = datetime.now(timezone.utc)
+    offsets = stream_offsets(settings)
+    source_lsn = db.current_wal_lsn(settings)
+    source_rows = db.execute_source_query(settings, source_query)
+    target_rows = search.execute_target_query(
+        settings,
+        target_query,
+        key_field=key_field,
+    )
+    guarantee = "existence"
+    if compare_fields:
+        guarantee = "existence+fieldEquality"
+    return compare_query_results(
+        invariant_name=invariant_name,
+        source_rows=source_rows,
+        target_rows=target_rows,
+        key_field=key_field,
+        compare_fields=compare_fields,
+        guarantee=guarantee,
         max_lag_seconds=max_lag_seconds,
         checked_at=checked_at,
         target_read_at=datetime.now(timezone.utc),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -137,3 +138,26 @@ def paid_order_summary(
         "count": int(count),
         "total_amount_cents": int(total_amount),
     }
+
+
+def execute_target_query(
+    settings: Settings,
+    query: str,
+    *,
+    key_field: str,
+) -> list[dict[str, Any]]:
+    if not query.strip():
+        raise ValueError("target query is required")
+    body = json.loads(query)
+    if not isinstance(body, dict):
+        raise ValueError("target query must be a JSON object")
+    body.setdefault("size", 10000)
+
+    os_client = client(settings)
+    response = os_client.search(index=settings.orders_index, body=body)
+    rows: list[dict[str, Any]] = []
+    for hit in response.get("hits", {}).get("hits", []):
+        source = dict(hit.get("_source") or {})
+        source.setdefault(key_field, str(hit.get("_id")))
+        rows.append(source)
+    return rows

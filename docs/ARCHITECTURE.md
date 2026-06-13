@@ -12,7 +12,7 @@ There are now three execution modes:
 
 - `demo-local`: deterministic no-Docker proof that models Postgres source rows and OpenSearch documents in memory.
 - Compose demo: real Postgres, Redpanda, and OpenSearch integration.
-- Kubernetes job-backed demo: a Go operator in kind creates Python checker and repair Jobs that connect to the Compose data systems and publish report ConfigMaps.
+- Kubernetes job-backed demo: a Go operator in kind creates scheduled Python checker and repair Jobs that connect to the Compose data systems and publish compact status ConfigMaps.
 
 All three modes use the same invariant/report semantics. The local proof is not the final runtime target; it is a fast, dependency-light way to prove the control loop.
 
@@ -137,9 +137,10 @@ repair command
 operator check-job path
   |
   |-- watch Invariant resources
-  |-- create one checker Job per Invariant generation
+  |-- create one checker Job per Invariant generation or scheduled check interval
   |-- run the Python checker in Kubernetes
-  |-- write status.json and report.json into a ConfigMap
+  |-- write full report to the worker report store
+  |-- write compact status.json and repair-input.json into a ConfigMap
   |-- patch Invariant.status from status.json
 
 operator repair-job path
@@ -147,10 +148,10 @@ operator repair-job path
   |-- observe DriftDetected checker report
   |-- find auto-approved RepairPolicy
   |-- create one repair Job per Invariant generation
-  |-- read checker report ConfigMap
+  |-- read checker repair-input ConfigMap
   |-- reindex missing/stale records from Postgres
   |-- verify the invariant
-  |-- write repair status.json and report.json into a ConfigMap
+  |-- write repair status.json and compact repair input into a ConfigMap
   |-- patch Invariant.status from repair status.json
 ```
 
@@ -298,13 +299,13 @@ Invariant CRD
   |
   |-- Go/controller-runtime watch
   |-- unstructured reconciler
-  |-- deterministic checker Job for this generation
+  |-- deterministic checker Job for this generation/checkID
   |-- Python checker runs against Postgres/Redpanda/OpenSearch
-  |-- report ConfigMap stores report.json and status.json
+  |-- report ConfigMap stores status.json and repair-input.json
   |-- DriftDetected status selects a RepairPolicy
   |-- deterministic repair Job reads the checker report
   |-- Python repair reindexes and verifies
-  |-- repair ConfigMap stores report.json and status.json
+  |-- repair ConfigMap stores status.json and repair-input.json
   |-- status subresource patch copies checker or repair status.json into Invariant.status
   |
 Invariant.status
@@ -316,9 +317,22 @@ The controller creates or ensures:
 - checker Role with ConfigMap get/create/patch/update
 - checker RoleBinding
 - checker Job
-- report ConfigMap handoff
+- compact report ConfigMap handoff
 - repair Job when an allowed RepairPolicy exists
 - repair result ConfigMap handoff
+
+Scheduled invariants use `spec.checkIntervalSeconds`. The controller computes a `checkID` from the invariant generation and the current interval slot. That gives repeated checks without duplicate Jobs inside the same interval.
+
+The first generic query path is intentionally scoped:
+
+```text
+Postgres sourceQuery
+OpenSearch JSON targetQuery
+keyField join
+optional compareFields equality
+```
+
+The older commerce checks remain as optimized hardcoded demo invariants. The `query` invariant type is the first step toward making `sourceQuery` and `targetQuery` executable API fields rather than documentation-only fields.
 
 The job-backed path is enabled with:
 

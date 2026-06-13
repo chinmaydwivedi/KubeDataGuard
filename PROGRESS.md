@@ -229,10 +229,10 @@ The project has crossed the important line: the operator is no longer only a loc
 Implemented and verified now:
 
 - Added `dataguard repair-job`.
-- Added ConfigMap report reading from the Python Kubernetes API helper.
+- Added ConfigMap repair-input reading from the Python Kubernetes API helper.
 - Refactored repair logic so the same function can repair from:
   - local `latest.json`
-  - in-cluster checker `report.json`
+  - in-cluster checker repair input
 - Added Go controller logic that:
   - detects `DriftDetected` checker reports
   - finds an auto-approved `RepairPolicy`
@@ -386,6 +386,66 @@ kind operator:
   restored generation 5 maxLagSeconds=60 -> Healthy, checkedRecords=41, drift_count=0
 ```
 
+## Latest Architecture Hardening Pass
+
+Implemented the first response to the architectural critique.
+
+What changed:
+
+- README now explicitly says this is a research-grade vertical-slice MVP, not a production-ready general data platform.
+- Added `spec.checkIntervalSeconds` to `Invariant`.
+- Added scheduled checker Jobs with `checkID` values derived from generation and interval slot.
+- Added `checkID`, `checkIntervalSeconds`, and `nextCheckAfter` status fields.
+- Added the first generic query invariant path:
+  - Postgres `sourceQuery`
+  - OpenSearch JSON `targetQuery`
+  - declared `keyField`
+  - optional `compareFields`
+- Changed Kubernetes ConfigMap handoff to compact payloads:
+  - `status.json`
+  - `repair-input.json`
+  - full reports stay in the worker report store and are referenced from status
+- Added `Dockerfile.operator`.
+- Added `k8s/operator.yaml` with operator Deployment/RBAC.
+- Added `make operator-image`.
+- Added `paid-orders-query-check` example `Invariant`.
+
+What this fixes:
+
+```text
+sourceQuery/targetQuery are no longer purely decorative for the new query invariant type.
+SLO checks can now repeat without spec edits.
+ConfigMaps no longer carry full drift report blobs.
+The Go operator can be built and deployed as a real in-cluster component.
+```
+
+What remains intentionally open:
+
+```text
+generic query support is currently Postgres -> OpenSearch only
+large scans still need DBLog-style chunking/watermarks/resume
+full reports need production object storage
+DataSource connectionSecret is still not wired into Jobs
+repair strategies beyond source-of-truth reindexing remain future work
+```
+
+Runtime-verified:
+
+```text
+Compose generic query check:
+  checked_records: 41
+  phase: Healthy
+  drift_count: 0
+
+kind in-cluster operator:
+  Deployment kubedataguard-operator rolled out
+  paid-orders-indexed: Healthy, checkID g11-t5937886, interval 300
+  paid-orders-aggregate: Healthy, checkID g10-t5937886, interval 300
+  paid-orders-freshness: Healthy, checkID g6-t5937886, interval 300
+  paid-orders-query-check: Healthy, checkID g1-t5937886, interval 300
+  query ConfigMap keys: status.json, repair-input.json
+```
+
 ## First Build Target
 
 Runtime-verify the local runnable demo:
@@ -409,7 +469,7 @@ Every paid order in Postgres must exist in OpenSearch within 60 seconds.
 ## Verification Completed
 
 - `PYTHONPATH=src python3 -m unittest discover -s tests`
-  - Passed: 15 tests
+  - Passed: 16 tests
 - `go test ./...`
   - Passed
 - `go build ./cmd/dataguard-operator`
@@ -467,8 +527,8 @@ Every paid order in Postgres must exist in OpenSearch within 60 seconds.
   - Passed
   - Created checker Jobs for `paid-orders-indexed` and `paid-orders-aggregate`
   - Checker Jobs connected from kind to Compose Postgres, Redpanda, and OpenSearch through `host.docker.internal`
-  - Checker Jobs wrote `status.json` and `report.json` ConfigMaps
-  - Operator patched `Invariant.status` from ConfigMap reports
+  - Checker Jobs wrote compact ConfigMaps
+  - Operator patched `Invariant.status` from ConfigMap status
   - Drifted data produced `DriftDetected`
   - Repaired data produced `Healthy`
 - Repair-backed operator run against kind:
@@ -500,12 +560,23 @@ Every paid order in Postgres must exist in OpenSearch within 60 seconds.
   - operator selected `reindex-stale-paid-orders`
   - repair Job produced `Healthy`, `driftCount=0`, `sloBreachCount=5`
   - restored generation 5 default SLO produced `Healthy`, `checkedRecords=41`, `driftCount=0`
+- Architecture hardening run:
+  - Passed
+  - generic query invariant against Compose produced `Healthy`, `checked_records=41`, `drift_count=0`
+  - `docker compose build dataguard` passed
+  - `make operator-image` passed
+  - in-cluster `kubedataguard-operator` Deployment rolled out
+  - scheduled checker Jobs used `checkID` values like `g1-t5937886`
+  - all four invariants were `Healthy`
+  - query report ConfigMap contained compact `status.json` and `repair-input.json` keys
 
 ## Verification Not Completed
 
 - A Kubernetes-native Postgres/Redpanda/OpenSearch demo stack has not been added yet; the current kind proof reaches the Compose services through `host.docker.internal`.
 - Source-of-truth reindex repair is implemented for existence and freshness drift. Broader repair strategies such as Kafka replay, cache invalidation, and aggregate backfill are not implemented yet.
 - Secrets are still represented by CRD sketches and annotations/defaults for the demo; production-grade Secret wiring is not implemented yet.
+- The generic query runner is intentionally limited to Postgres source queries and OpenSearch JSON target queries.
+- Full report persistence still needs an object-store backend; the current Kubernetes path keeps ConfigMaps compact and uses file-style report references from the worker.
 
 ## Intermediate Roadmap Before Mature Operator
 
@@ -519,6 +590,7 @@ Do not jump directly from Compose verification to a full controller. Build these
 2. Stabilize report persistence.
    - For the local CLI, keep writing JSON/Markdown reports.
    - For Compose on this machine, reports are written through `${HOME}/.kubedataguard/reports:/workspace/reports`.
+   - For Kubernetes, ConfigMaps now carry compact `status.json` and `repair-input.json`.
    - For Kubernetes, store summary fields in the `Invariant.status` subresource:
      - `healthy`
      - `phase`
@@ -530,6 +602,9 @@ Do not jump directly from Compose verification to a full controller. Build these
      - `counterexampleCount`
      - `reportRef`
      - `observedGeneration`
+     - `checkID`
+     - `checkIntervalSeconds`
+     - `nextCheckAfter`
 
 3. Expand second invariant type: aggregate check.
    - Implemented: paid order count and paid revenue total in Postgres must match OpenSearch aggregation.
@@ -550,6 +625,8 @@ Do not jump directly from Compose verification to a full controller. Build these
    - Initial synthetic reconciler: implemented.
    - Job-backed checker reconciliation: implemented and runtime-verified.
    - Repair Job reconciliation from `RepairPolicy`: implemented and runtime-verified for `reindex-records`.
+   - Scheduled checker Jobs: implemented.
+   - Operator image/deployment sketch: implemented.
    - Next: emit metrics and events.
 
 ## Research-Backed Model Upgrades
@@ -683,9 +760,9 @@ Current answer:
 
 - Store compact truth in `Invariant.status`.
 - Store verbose JSON/Markdown reports externally.
-- First controller implementation uses `reportRef=configmap://namespace/name/report.json`.
-- Current repair provenance is stored in the repair result ConfigMap.
-- Next blocking decision: how much repair provenance should also be summarized in `Invariant.status`.
+- Controller ConfigMaps now carry compact `status.json` plus `repair-input.json`.
+- `reportRef` now points at the worker report store path for full evidence reports.
+- Next blocking decision: which production report store should be implemented first: MinIO/S3, GCS, or database-backed report storage.
 
 ### Next Sprint
 
@@ -694,8 +771,9 @@ Current answer:
 Current answer:
 
 - Aggregate checks are now implemented for paid-order count and revenue total.
-- Add lag-aware freshness next because it maps directly to DDIA replication lag and the report evidence model.
-- After freshness, add session/client guarantees only if the demo can capture per-client histories.
+- Lag-aware freshness is implemented for the commerce demo.
+- First generic Postgres/OpenSearch query invariant is implemented.
+- Next: DBLog-style chunked scans and Secret-backed `DataSource` resolution.
 
 ### Future
 

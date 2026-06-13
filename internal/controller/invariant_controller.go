@@ -178,6 +178,8 @@ func guaranteeForInvariantType(invariantType string) string {
 		return "aggregate"
 	case "freshness":
 		return "boundedFreshness"
+	case "query":
+		return "query"
 	case "fieldEquality":
 		return "fieldEquality"
 	case "count":

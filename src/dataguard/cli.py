@@ -44,27 +44,30 @@ def main() -> None:
     check_parser.add_argument("--max-lag-seconds", type=int, default=60)
     check_parser.add_argument(
         "--invariant",
-        choices=["existence", "aggregate", "freshness"],
+        choices=["existence", "aggregate", "freshness", "query"],
         default="existence",
         help="which invariant to check",
     )
+    add_query_args(check_parser)
     check_parser.add_argument("--write-report", action="store_true")
 
     check_job_parser = subcommands.add_parser(
         "check-job",
-        help="run an invariant check from a Kubernetes Job and publish a ConfigMap result",
+        help="run an invariant check from a Kubernetes Job and publish a compact ConfigMap result",
     )
     check_job_parser.add_argument("--max-lag-seconds", type=int, default=60)
     check_job_parser.add_argument(
         "--invariant",
-        choices=["existence", "aggregate", "freshness"],
+        choices=["existence", "aggregate", "freshness", "query"],
         default="existence",
         help="which invariant to check",
     )
+    add_query_args(check_job_parser)
     check_job_parser.add_argument("--namespace")
     check_job_parser.add_argument("--config-map", required=True)
     check_job_parser.add_argument("--invariant-name", required=True)
     check_job_parser.add_argument("--observed-generation", type=int, default=0)
+    check_job_parser.add_argument("--check-id", default="")
 
     repair_parser = subcommands.add_parser("repair", help="repair drift from a report")
     repair_parser.add_argument("--report", type=Path)
@@ -72,9 +75,10 @@ def main() -> None:
     repair_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_parser.add_argument(
         "--verify-invariant",
-        choices=["existence", "aggregate", "freshness"],
+        choices=["existence", "aggregate", "freshness", "query"],
         default="existence",
     )
+    add_query_args(repair_parser)
 
     repair_job_parser = subcommands.add_parser(
         "repair-job",
@@ -85,12 +89,14 @@ def main() -> None:
     repair_job_parser.add_argument("--config-map", required=True)
     repair_job_parser.add_argument("--invariant-name", required=True)
     repair_job_parser.add_argument("--observed-generation", type=int, default=0)
+    repair_job_parser.add_argument("--check-id", default="")
     repair_job_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_job_parser.add_argument(
         "--verify-invariant",
-        choices=["existence", "aggregate", "freshness"],
+        choices=["existence", "aggregate", "freshness", "query"],
         default="existence",
     )
+    add_query_args(repair_job_parser)
 
     local_demo_parser = subcommands.add_parser(
         "demo-local",
@@ -221,6 +227,11 @@ def run_check(settings: Settings, args: argparse.Namespace):
         settings,
         invariant=args.invariant,
         max_lag_seconds=args.max_lag_seconds,
+        invariant_name=getattr(args, "invariant_name", None),
+        source_query=getattr(args, "source_query", None),
+        target_query=getattr(args, "target_query", None),
+        key_field=getattr(args, "key_field", "id"),
+        compare_fields=parse_compare_fields(getattr(args, "compare_fields", "")),
     )
 
     payload = report.to_dict()
@@ -241,15 +252,22 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
         settings,
         invariant=args.invariant,
         max_lag_seconds=args.max_lag_seconds,
+        invariant_name=args.invariant_name,
+        source_query=args.source_query,
+        target_query=args.target_query,
+        key_field=args.key_field,
+        compare_fields=parse_compare_fields(args.compare_fields),
     )
 
-    report_ref = f"configmap://{args.namespace or namespace_from_service_account()}/{args.config_map}/report.json"
     payload = report.to_dict()
+    json_path, _markdown_path = write_reports(settings.report_dir, report)
+    report_ref = f"file://{json_path}"
     status = report.kubernetes_status(report_ref=report_ref)
     status["observedGeneration"] = args.observed_generation
+    if args.check_id:
+        status["checkID"] = args.check_id
     payload["kubernetes_status"] = status
 
-    write_reports(settings.report_dir, report)
     namespace = args.namespace or namespace_from_service_account()
     publish_report_configmap(
         namespace=namespace,
@@ -272,6 +290,11 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
             settings,
             invariant=args.verify_invariant,
             max_lag_seconds=args.max_lag_seconds,
+            invariant_name=getattr(args, "invariant_name", None),
+            source_query=args.source_query,
+            target_query=args.target_query,
+            key_field=args.key_field,
+            compare_fields=parse_compare_fields(args.compare_fields),
         )
         print("post-repair verification:")
         print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
@@ -280,12 +303,12 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
 def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
     from . import checker, repair
     from .k8s_report import namespace_from_service_account, publish_report_configmap, read_configmap_data
+    from .reporting import write_reports
 
     namespace = args.namespace or namespace_from_service_account()
-    source_report_ref = f"configmap://{namespace}/{args.report_config_map}/report.json"
-    repair_report_ref = f"configmap://{namespace}/{args.config_map}/report.json"
+    source_report_ref = f"configmap://{namespace}/{args.report_config_map}/repair-input.json"
     source_data = read_configmap_data(namespace=namespace, name=args.report_config_map)
-    source_report = json.loads(source_data["report.json"])
+    source_report = json.loads(source_data.get("repair-input.json") or source_data["report.json"])
 
     repair_result = repair.repair_from_payload(settings, source_report)
     repair_result["sourceReportRef"] = source_report_ref
@@ -295,15 +318,25 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
         settings,
         invariant=args.verify_invariant,
         max_lag_seconds=args.max_lag_seconds,
+        invariant_name=args.invariant_name,
+        source_query=args.source_query,
+        target_query=args.target_query,
+        key_field=args.key_field,
+        compare_fields=parse_compare_fields(args.compare_fields),
     )
 
+    verification_payload = verification.to_dict()
+    json_path, _markdown_path = write_reports(settings.report_dir, verification)
+    repair_report_ref = f"file://{json_path}"
     payload, status = build_repair_job_result(
         invariant_name=args.invariant_name,
         source_report_ref=source_report_ref,
         repair_report_ref=repair_report_ref,
         repair_result=repair_result,
         verification=verification,
+        verification_payload=verification_payload,
         observed_generation=args.observed_generation,
+        check_id=args.check_id,
     )
     publish_report_configmap(
         namespace=namespace,
@@ -314,7 +347,29 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
     print(json.dumps({"configMap": args.config_map, "status": status}, indent=2, sort_keys=True))
 
 
-def check_invariant(checker, settings: Settings, *, invariant: str, max_lag_seconds: int):
+def add_query_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--source-query", default="")
+    parser.add_argument("--target-query", default="")
+    parser.add_argument("--key-field", default="id")
+    parser.add_argument("--compare-fields", default="")
+
+
+def parse_compare_fields(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+def check_invariant(
+    checker,
+    settings: Settings,
+    *,
+    invariant: str,
+    max_lag_seconds: int,
+    invariant_name: str | None = None,
+    source_query: str | None = None,
+    target_query: str | None = None,
+    key_field: str = "id",
+    compare_fields: list[str] | None = None,
+):
     if invariant == "existence":
         return checker.check_paid_orders_indexed(
             settings,
@@ -330,6 +385,20 @@ def check_invariant(checker, settings: Settings, *, invariant: str, max_lag_seco
             settings,
             max_lag_seconds=max_lag_seconds,
         )
+    if invariant == "query":
+        if not source_query:
+            raise SystemExit("--source-query is required for query invariants")
+        if not target_query:
+            raise SystemExit("--target-query is required for query invariants")
+        return checker.check_query_invariant(
+            settings,
+            invariant_name=invariant_name or "query-invariant",
+            source_query=source_query,
+            target_query=target_query,
+            key_field=key_field,
+            compare_fields=compare_fields or [],
+            max_lag_seconds=max_lag_seconds,
+        )
     raise SystemExit(f"unknown invariant: {invariant}")
 
 
@@ -340,11 +409,15 @@ def build_repair_job_result(
     repair_report_ref: str,
     repair_result: dict,
     verification,
+    verification_payload: dict | None = None,
     observed_generation: int,
+    check_id: str = "",
 ) -> tuple[dict, dict]:
-    verification_payload = verification.to_dict()
+    verification_payload = verification_payload or verification.to_dict()
     status = verification.kubernetes_status(report_ref=repair_report_ref)
     status["observedGeneration"] = observed_generation
+    if check_id:
+        status["checkID"] = check_id
     status["repairRef"] = repair_report_ref
     status["repairAction"] = "reindex-records"
     if not verification.healthy:

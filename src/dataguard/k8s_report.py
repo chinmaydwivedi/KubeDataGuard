@@ -41,7 +41,7 @@ def publish_report_configmap(
             },
         },
         "data": {
-            "report.json": json.dumps(report, indent=2, sort_keys=True),
+            "repair-input.json": json.dumps(repair_input(report), indent=2, sort_keys=True),
             "status.json": json.dumps(status, indent=2, sort_keys=True),
         },
     }
@@ -124,3 +124,34 @@ def read_configmap_data(*, namespace: str, name: str) -> dict[str, str]:
     if not isinstance(data, dict):
         raise ValueError(f"ConfigMap {namespace}/{name} has no data object")
     return {str(key): str(value) for key, value in data.items()}
+
+
+def repair_input(report: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": report.get("kind", "KubeDataGuardRepairInput"),
+        "invariant": report.get("invariant"),
+        "status": report.get("status"),
+        "healthy": report.get("healthy"),
+        "missing": candidate_items(report.get("missing", [])),
+        "stale": candidate_items(report.get("stale", [])),
+        "freshness_violations": candidate_items(report.get("freshness_violations", [])),
+        "aggregate_mismatches": report.get("aggregate_mismatches", []),
+        "sourceReportRef": report.get("sourceReportRef"),
+    }
+
+
+def candidate_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        compact.append(
+            {
+                key: value
+                for key, value in item.items()
+                if key in {"order_id", "reason", "mismatches"}
+            }
+        )
+    return compact

@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Iterable
 
 import psycopg
@@ -236,6 +237,16 @@ def fetch_orders_by_ids(settings: Settings, order_ids: Iterable[str]) -> list[di
             return [serialize_order(row) for row in cur.fetchall()]
 
 
+def execute_source_query(settings: Settings, query: str) -> list[dict[str, Any]]:
+    if not query.strip():
+        raise ValueError("source query is required")
+    with connect(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+    return [serialize_query_row(row) for row in rows]
+
+
 def set_orders_updated_at(
     settings: Settings,
     order_ids: Iterable[str],
@@ -263,3 +274,17 @@ def _iso(value: Any) -> str:
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc).isoformat()
     return str(value)
+
+
+def serialize_query_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {str(key): json_safe_value(value) for key, value in row.items()}
+
+
+def json_safe_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value

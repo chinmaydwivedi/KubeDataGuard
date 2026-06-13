@@ -98,7 +98,8 @@ func TestBuildCheckerJobUsesInvariantConfiguration(t *testing.T) {
 		},
 	)
 
-	job, err := BuildCheckerJob(invariant)
+	run := CheckRun{ID: "g3"}
+	job, err := BuildCheckerJob(invariant, run)
 	if err != nil {
 		t.Fatalf("BuildCheckerJob returned error: %v", err)
 	}
@@ -119,6 +120,9 @@ func TestBuildCheckerJobUsesInvariantConfiguration(t *testing.T) {
 	}
 	if !contains(container.Args, "--observed-generation") {
 		t.Fatalf("job args do not contain observed generation: %#v", container.Args)
+	}
+	if !contains(container.Args, "--check-id") || !contains(container.Args, "g3") {
+		t.Fatalf("job args do not contain check id: %#v", container.Args)
 	}
 
 	env := map[string]string{}
@@ -144,7 +148,8 @@ func TestBuildRepairJobUsesReportHandoffConfiguration(t *testing.T) {
 		},
 	)
 
-	job, err := BuildRepairJob(invariant, "dataguard-report-paid-orders-indexed-g3")
+	run := CheckRun{ID: "g3"}
+	job, err := BuildRepairJob(invariant, "dataguard-report-paid-orders-indexed-g3", run)
 	if err != nil {
 		t.Fatalf("BuildRepairJob returned error: %v", err)
 	}
@@ -167,6 +172,8 @@ func TestBuildRepairJobUsesReportHandoffConfiguration(t *testing.T) {
 		"--config-map",
 		"--verify-invariant",
 		"existence",
+		"--check-id",
+		"g3",
 	} {
 		if !contains(container.Args, want) {
 			t.Fatalf("repair job args do not contain %q: %#v", want, container.Args)
@@ -177,7 +184,7 @@ func TestBuildRepairJobUsesReportHandoffConfiguration(t *testing.T) {
 func TestBuildCheckerJobPassesFreshnessInvariantToWorker(t *testing.T) {
 	invariant := invariantObject("paid-orders-freshness", "freshness", nil)
 
-	job, err := BuildCheckerJob(invariant)
+	job, err := BuildCheckerJob(invariant, CheckRun{ID: "g3"})
 	if err != nil {
 		t.Fatalf("BuildCheckerJob returned error: %v", err)
 	}
@@ -185,6 +192,38 @@ func TestBuildCheckerJobPassesFreshnessInvariantToWorker(t *testing.T) {
 	args := job.Spec.Template.Spec.Containers[0].Args
 	if !contains(args, "--invariant") || !contains(args, "freshness") {
 		t.Fatalf("checker job args do not select freshness: %#v", args)
+	}
+}
+
+func TestBuildCheckerJobPassesQueryInvariantConfigurationToWorker(t *testing.T) {
+	invariant := invariantObject("paid-orders-query-check", "query", nil)
+	spec := invariant.Object["spec"].(map[string]any)
+	spec["sourceQuery"] = "select id, status from orders where status = 'paid'"
+	spec["targetQuery"] = `{"query":{"term":{"status":"paid"}}}`
+	spec["keyField"] = "id"
+	spec["compareFields"] = []any{"status", "version"}
+
+	job, err := BuildCheckerJob(invariant, CheckRun{ID: "g3"})
+	if err != nil {
+		t.Fatalf("BuildCheckerJob returned error: %v", err)
+	}
+
+	args := job.Spec.Template.Spec.Containers[0].Args
+	for _, want := range []string{
+		"--invariant",
+		"query",
+		"--source-query",
+		"select id, status from orders where status = 'paid'",
+		"--target-query",
+		`{"query":{"term":{"status":"paid"}}}`,
+		"--key-field",
+		"id",
+		"--compare-fields",
+		"status,version",
+	} {
+		if !contains(args, want) {
+			t.Fatalf("query checker args do not contain %q: %#v", want, args)
+		}
 	}
 }
 
@@ -221,8 +260,9 @@ func TestRepairPolicyAllowsAutoReindexOnlyWithoutApproval(t *testing.T) {
 func TestLifecycleFailureStatusesDistinguishCheckAndRepairFailure(t *testing.T) {
 	invariant := invariantObject("paid-orders-indexed", "existence", nil)
 	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	run := CheckRun{ID: "g3"}
 
-	checkFailed := BuildJobFailedStatus(invariant, now, "check-job", "source unavailable")
+	checkFailed := BuildJobFailedStatus(invariant, now, "check-job", run, "source unavailable")
 	if checkFailed["phase"] != PhaseCheckFailed {
 		t.Fatalf("check failed phase = %v, want %s", checkFailed["phase"], PhaseCheckFailed)
 	}
@@ -232,8 +272,11 @@ func TestLifecycleFailureStatusesDistinguishCheckAndRepairFailure(t *testing.T) 
 	if checkFailed["reason"] != "source unavailable" {
 		t.Fatalf("check reason = %v", checkFailed["reason"])
 	}
+	if checkFailed["checkID"] != "g3" {
+		t.Fatalf("checkID = %v, want g3", checkFailed["checkID"])
+	}
 
-	repairing := BuildRepairRunningStatus(invariant, now, "repair-job", 8)
+	repairing := BuildRepairRunningStatus(invariant, now, "repair-job", run, 8)
 	if repairing["phase"] != PhaseRepairing {
 		t.Fatalf("repairing phase = %v, want %s", repairing["phase"], PhaseRepairing)
 	}
@@ -241,7 +284,7 @@ func TestLifecycleFailureStatusesDistinguishCheckAndRepairFailure(t *testing.T) 
 		t.Fatalf("repairing driftCount = %v, want 8", repairing["driftCount"])
 	}
 
-	repairFailed := BuildRepairFailedStatus(invariant, now, "repair-job", 8, "verification still found drift")
+	repairFailed := BuildRepairFailedStatus(invariant, now, "repair-job", run, 8, "verification still found drift")
 	if repairFailed["phase"] != PhaseRepairFailed {
 		t.Fatalf("repair failed phase = %v, want %s", repairFailed["phase"], PhaseRepairFailed)
 	}
@@ -253,6 +296,28 @@ func TestLifecycleFailureStatusesDistinguishCheckAndRepairFailure(t *testing.T) 
 	}
 	if repairFailed["reason"] != "verification still found drift" {
 		t.Fatalf("repair reason = %v", repairFailed["reason"])
+	}
+}
+
+func TestCurrentCheckRunUsesIntervalSlotWhenScheduled(t *testing.T) {
+	invariant := invariantObject("paid-orders-indexed", "existence", nil)
+	spec := invariant.Object["spec"].(map[string]any)
+	spec["checkIntervalSeconds"] = int64(60)
+	now := time.Unix(125, 0).UTC()
+
+	run, err := currentCheckRun(invariant, now)
+	if err != nil {
+		t.Fatalf("currentCheckRun returned error: %v", err)
+	}
+
+	if run.ID != "g3-t2" {
+		t.Fatalf("check ID = %q, want g3-t2", run.ID)
+	}
+	if !run.Scheduled {
+		t.Fatal("Scheduled = false, want true")
+	}
+	if run.NextRequeue != 55*time.Second {
+		t.Fatalf("NextRequeue = %v, want 55s", run.NextRequeue)
 	}
 }
 
@@ -299,6 +364,7 @@ func TestReportStatusAlreadyAppliedComparesControllerStatusIdentity(t *testing.T
 		"checkedRecords":      int64(41),
 		"reportRef":           "configmap://default/dataguard-report-paid-orders-indexed-g3/report.json",
 		"observedGeneration":  int64(3),
+		"checkID":             "g3",
 	}
 	if err := unstructured.SetNestedMap(invariant.Object, status, "status"); err != nil {
 		t.Fatalf("set status: %v", err)

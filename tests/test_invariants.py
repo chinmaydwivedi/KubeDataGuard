@@ -7,6 +7,7 @@ from dataguard.invariants import (
     compare_paid_order_aggregates,
     compare_paid_order_freshness,
     compare_paid_orders_to_index,
+    compare_query_results,
     summarize_paid_orders,
 )
 from dataguard.cli import build_repair_job_result
@@ -276,6 +277,49 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
 
         self.assertTrue(report.healthy)
         self.assertEqual(report.drift_count, 0)
+
+    def test_query_results_detect_missing_and_field_mismatch(self):
+        source = [
+            {
+                "id": "order-1",
+                "status": "paid",
+                "amount_cents": 1200,
+                "currency": "USD",
+                "version": 1,
+            },
+            {
+                "id": "order-2",
+                "status": "paid",
+                "amount_cents": 800,
+                "currency": "USD",
+                "version": 2,
+            },
+        ]
+        target = [
+            {
+                "id": "order-2",
+                "status": "paid",
+                "amount_cents": 700,
+                "currency": "USD",
+                "version": 1,
+            }
+        ]
+
+        report = compare_query_results(
+            invariant_name="paid-orders-query-check",
+            source_rows=source,
+            target_rows=target,
+            key_field="id",
+            compare_fields=["status", "amount_cents", "currency", "version"],
+            guarantee="existence+fieldEquality",
+        )
+
+        self.assertFalse(report.healthy)
+        self.assertEqual(report.invariant, "paid-orders-query-check")
+        self.assertEqual(report.drift_count, 2)
+        self.assertEqual(report.missing[0]["order_id"], "order-1")
+        mismatch_fields = {item["field"] for item in report.stale[0]["mismatches"]}
+        self.assertEqual(mismatch_fields, {"amount_cents", "version"})
 
     def test_local_proof_detects_repairs_and_verifies(self):
         result = run_local_proof(count=10, skip_every_paid=5)

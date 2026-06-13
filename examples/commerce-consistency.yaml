@@ -33,6 +33,7 @@ metadata:
 spec:
   derivedViewRef: orders-search-index
   type: existence
+  checkIntervalSeconds: 300
   maxLagSeconds: 60
   severity: critical
   sourceQuery: |
@@ -50,6 +51,7 @@ metadata:
 spec:
   derivedViewRef: orders-search-index
   type: aggregate
+  checkIntervalSeconds: 300
   maxLagSeconds: 60
   severity: critical
   sourceQuery: |
@@ -70,6 +72,7 @@ metadata:
 spec:
   derivedViewRef: orders-search-index
   type: freshness
+  checkIntervalSeconds: 300
   maxLagSeconds: 60
   severity: critical
   sourceQuery: |
@@ -87,6 +90,43 @@ spec:
   actions:
     - type: reindex-records
       batchSize: 500
+---
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
+  name: paid-orders-query-check
+  annotations:
+    dataguard.io/checker-mode: job
+    dataguard.io/checker-image: kubedataguard-dataguard:latest
+spec:
+  derivedViewRef: orders-search-index
+  type: query
+  checkIntervalSeconds: 300
+  maxLagSeconds: 60
+  keyField: id
+  compareFields:
+    - status
+    - amount_cents
+    - currency
+    - version
+  sourceQuery: |
+    select id, status, amount_cents, currency, version, updated_at
+    from orders
+    where status = 'paid'
+      and updated_at <= now() - interval '60 seconds'
+    order by updated_at asc, id asc
+  targetQuery: |
+    {
+      "size": 10000,
+      "query": {
+        "bool": {
+          "filter": [
+            {"term": {"status": "paid"}},
+            {"range": {"updated_at": {"lte": "now-60s"}}}
+          ]
+        }
+      }
+    }
 ---
 apiVersion: dataguard.io/v1alpha1
 kind: RepairPolicy
