@@ -1,0 +1,100 @@
+apiVersion: dataguard.io/v1alpha1
+kind: DataSource
+metadata:
+  name: orders-postgres
+spec:
+  type: postgres
+  connectionSecret: orders-postgres-secret
+  database: dataguard
+  tables:
+    - orders
+---
+apiVersion: dataguard.io/v1alpha1
+kind: DerivedView
+metadata:
+  name: orders-search-index
+spec:
+  sourceRef: orders-postgres
+  target:
+    type: opensearch
+    connectionSecret: orders-opensearch-secret
+    index: orders
+  pipeline:
+    type: kafka
+    topic: orders.events
+---
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
+  name: paid-orders-indexed
+  annotations:
+    dataguard.io/checker-mode: job
+    dataguard.io/checker-image: kubedataguard-dataguard:latest
+spec:
+  derivedViewRef: orders-search-index
+  type: existence
+  maxLagSeconds: 60
+  severity: critical
+  sourceQuery: |
+    select id from orders where status = 'paid'
+  targetQuery: |
+    ids in OpenSearch index `orders`
+---
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
+  name: paid-orders-aggregate
+  annotations:
+    dataguard.io/checker-mode: job
+    dataguard.io/checker-image: kubedataguard-dataguard:latest
+spec:
+  derivedViewRef: orders-search-index
+  type: aggregate
+  maxLagSeconds: 60
+  severity: critical
+  sourceQuery: |
+    select count(*), coalesce(sum(amount_cents), 0)
+    from orders
+    where status = 'paid'
+  targetQuery: |
+    OpenSearch count and sum(amount_cents)
+    where status = 'paid'
+---
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
+  name: paid-orders-freshness
+  annotations:
+    dataguard.io/checker-mode: job
+    dataguard.io/checker-image: kubedataguard-dataguard:latest
+spec:
+  derivedViewRef: orders-search-index
+  type: freshness
+  maxLagSeconds: 60
+  severity: critical
+  sourceQuery: |
+    select id, updated_at from orders where status = 'paid'
+  targetQuery: |
+    OpenSearch indexed_at must be within 60 seconds of source updated_at
+---
+apiVersion: dataguard.io/v1alpha1
+kind: RepairPolicy
+metadata:
+  name: reindex-missing-paid-orders
+spec:
+  invariantRef: paid-orders-indexed
+  approvalRequired: false
+  actions:
+    - type: reindex-records
+      batchSize: 500
+---
+apiVersion: dataguard.io/v1alpha1
+kind: RepairPolicy
+metadata:
+  name: reindex-stale-paid-orders
+spec:
+  invariantRef: paid-orders-freshness
+  approvalRequired: false
+  actions:
+    - type: reindex-records
+      batchSize: 500

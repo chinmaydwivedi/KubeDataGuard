@@ -1,0 +1,715 @@
+# Progress: KubeDataGuard
+
+## Current Status
+
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified.
+
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
+
+## Decisions Made
+
+- This is the first project to implement.
+- Start with Docker Compose before a full Kubernetes operator.
+- Start with one invariant type: existence.
+- Start with one source and one derived store:
+  - Source: Postgres
+  - Event log: Redpanda/Kafka
+  - Derived store: OpenSearch
+- Use Python for the local MVP.
+- Use Go/controller-runtime for the long-term Kubernetes operator.
+- Include CRD sketches early; build the data-integrated controller only after the local loop is runtime-verified.
+- Keep external-service imports lazy so the no-Docker proof can run without Postgres/Kafka/OpenSearch client packages.
+- Use a hybrid implementation model: Go operator for Kubernetes reconciliation, Python checker/repair workers for data integrations and invariant logic.
+
+## Demo Story
+
+The five-minute GitHub demo should look like this:
+
+```sh
+make up       # starts Postgres, Redpanda, Redpanda Console, and OpenSearch
+make seed     # resets the demo and inserts 50 orders, most marked paid
+make drift    # simulates an indexer bug that commits some paid events without indexing them
+make check    # reports missing paid orders with order IDs and source details
+make repair   # reindexes missing/stale orders from Postgres and verifies the invariant
+make check    # produces a clean report
+```
+
+This sequence is the value proposition: the user sees a derived view drift from the source of truth, gets a concrete report, repairs from the source of truth, and verifies the data is trustworthy again.
+
+Current runnable proof on this machine:
+
+```sh
+make demo-local
+```
+
+This produces:
+
+```text
+report_type: kubedataguard-local-proof
+before existence: DriftDetected
+before aggregate: DriftDetected
+repair: reindex-records-from-source
+after existence: Healthy
+after aggregate: Healthy
+```
+
+## Implemented Files
+
+- `docker-compose.yml`
+- `Dockerfile`
+- `go.mod`
+- `go.sum`
+- `Makefile`
+- `requirements.txt`
+- `src/dataguard/config.py`
+- `src/dataguard/db.py`
+- `src/dataguard/events.py`
+- `src/dataguard/search.py`
+- `src/dataguard/invariants.py`
+- `src/dataguard/reporting.py`
+- `src/dataguard/generator.py`
+- `src/dataguard/indexer.py`
+- `src/dataguard/checker.py`
+- `src/dataguard/repair.py`
+- `src/dataguard/local_demo.py`
+- `src/dataguard/k8s_report.py`
+- `src/dataguard/cli.py`
+- `tests/test_invariants.py`
+- `docs/ARCHITECTURE.md`
+- `docs/RUNBOOK.md`
+- `docs/KNOWLEDGE_BASE.md`
+- `k8s/crds/*.yaml`
+- `examples/commerce-consistency.yaml`
+- `cmd/dataguard-operator/main.go`
+- `internal/controller/invariant_controller.go`
+- `internal/controller/job_handoff.go`
+- `internal/controller/invariant_controller_test.go`
+
+## Latest Deep-System-Design Pass
+
+Implemented in this pass:
+
+- Added report `status` values such as `Healthy` and `DriftDetected`.
+- Added explicit `guarantee` labels for invariant semantics.
+- Added `observation_window` evidence:
+  - check time
+  - target read time
+  - max lag
+  - eligible source boundary
+  - source watermark
+  - stream topic
+- Added `counterexamples` for missing, stale, and aggregate drift.
+- Added aggregate invariant logic for paid-order count and paid revenue total.
+- Added `dataguard check --invariant aggregate`.
+- Added `make check-aggregate`.
+- Updated the Invariant CRD sketch with phase, guarantee, check status, observation window, and counterexample count.
+- Updated the example consistency policy with `paid-orders-aggregate`.
+
+## Latest Execution Pass
+
+Implemented now:
+
+- Added `dataguard demo-local`.
+- Added `make demo-local`.
+- Added deterministic local source rows and derived-index drift.
+- Added a proof payload with:
+  - source summary
+  - derived-before summary
+  - existence and aggregate reports before repair
+  - repair provenance
+  - derived-after summary
+  - existence and aggregate reports after repair
+- Added stream offset start/end evidence to observation windows.
+- Made CLI external integrations lazy-loaded so the no-Docker proof does not require unavailable service client packages.
+- Added tests for stream offset evidence and the local proof.
+- Added `kubernetes_status` payloads to reports so Go/controller-runtime code can update `Invariant.status` without parsing verbose evidence.
+
+## Earlier Operator Skeleton Pass
+
+Implemented now:
+
+- Added Go module for the Kubernetes operator.
+- Added controller-runtime manager entrypoint.
+- Added unstructured `Invariant` reconciler.
+- Added synthetic status builder.
+- Added support for `dataguard.io/synthetic-drift-count`.
+- Enabled the CRD `status` subresource.
+- Extended CRD status schema with:
+  - `checkedRecords`
+  - `observedGeneration`
+  - `observationWindow.checkedAt`
+  - `observationWindow.targetReadAt`
+  - `observationWindow.streamOffsetStart`
+  - `observationWindow.streamOffsetEnd`
+- Added `make operator-test`.
+- Added `make operator-build`.
+
+Current behavior:
+
+```text
+Invariant without synthetic drift -> status.phase=Healthy
+Invariant with dataguard.io/synthetic-drift-count > 0 -> status.phase=DriftDetected
+```
+
+This proved the Kubernetes reconciliation/status path before the job-backed data integration was added.
+
+## Latest Runtime Verification Pass
+
+Implemented and verified now:
+
+- Installed Docker CLI runtime through Homebrew:
+  - `colima`
+  - `docker`
+  - `docker-compose`
+  - `kind`
+- Started Colima with Docker runtime.
+- Verified Docker with `docker run --rm hello-world`.
+- Patched Compose report persistence to avoid the macOS protected `Documents` bind mount:
+  - reports now mount to `${HOME}/.kubedataguard/reports`
+- Ran the full Compose stack:
+  - Postgres
+  - Redpanda
+  - Redpanda Console
+  - OpenSearch
+  - `dataguard` CLI image
+- Runtime-verified drift detection:
+  - generated 50 orders
+  - deliberately skipped 8 paid orders in the indexer
+  - existence invariant detected 8 missing derived records
+  - aggregate invariant detected count and revenue drift
+- Runtime-verified repair:
+  - reindexed 8 missing orders from Postgres
+  - post-repair existence invariant was `Healthy`
+  - post-repair aggregate invariant was `Healthy`
+- Runtime-verified Kubernetes skeleton:
+  - created kind cluster `kubedataguard`
+  - applied all DataGuard CRDs
+  - applied example commerce resources
+  - ran the Go operator locally against kind
+  - observed `Invariant.status` update to `Healthy`
+  - annotated an invariant with `dataguard.io/synthetic-drift-count=3`
+  - observed `Invariant.status.phase=DriftDetected`
+  - reset annotation to `0` and observed `Healthy` again
+
+## Latest Kubernetes Job Handoff Pass
+
+Implemented and verified now:
+
+- Added `dataguard check-job`.
+- Added Kubernetes ConfigMap report publishing from the Python checker.
+- Added `src/dataguard/k8s_report.py` using the in-cluster service account token and Kubernetes API.
+- Added `dataguard.io/checker-mode=job` support on `Invariant` resources.
+- Added Go controller logic that:
+  - creates one deterministic checker Job per `Invariant` generation
+  - creates checker ServiceAccount, Role, and RoleBinding
+  - passes Postgres, Redpanda/Kafka, OpenSearch, topic, index, invariant, max lag, namespace, ConfigMap, and generation into the Job
+  - waits for the Job's report ConfigMap
+  - decodes `status.json`
+  - patches `Invariant.status`
+  - distinguishes running/check-failed states from data drift
+- Added idempotence guard so completed report status is not re-patched repeatedly.
+- Updated example invariants to opt into job-backed mode.
+
+Runtime-verified against kind plus the Compose data systems:
+
+```text
+Invariant generation 2 -> checker Jobs -> report ConfigMaps -> status DriftDetected
+paid-orders-indexed: 8 drift records
+paid-orders-aggregate: 2 aggregate mismatches
+
+repair from Postgres -> Invariant generation 3 -> checker Jobs -> status Healthy
+
+restore example spec -> Invariant generation 4 -> checker Jobs -> status Healthy
+```
+
+The project has crossed the important line: the operator is no longer only a local CLI plus a synthetic Kubernetes skeleton. It now uses Kubernetes reconciliation to run real data checks and update CRD status from real reports.
+
+## Latest Kubernetes Repair Handoff Pass
+
+Implemented and verified now:
+
+- Added `dataguard repair-job`.
+- Added ConfigMap report reading from the Python Kubernetes API helper.
+- Refactored repair logic so the same function can repair from:
+  - local `latest.json`
+  - in-cluster checker `report.json`
+- Added Go controller logic that:
+  - detects `DriftDetected` checker reports
+  - finds an auto-approved `RepairPolicy`
+  - creates one deterministic repair Job per `Invariant` generation
+  - passes the checker report ConfigMap into the repair Job
+  - lets the repair Job reindex missing/stale records from Postgres into OpenSearch
+  - verifies the invariant after repair
+  - reads the repair result ConfigMap before the stale drift report
+  - patches `Invariant.status` to `Healthy` or `RepairFailed`
+- Added `Repairing` and `RepairFailed` lifecycle status builders.
+- Added tests for repair Job construction, auto-repair policy gating, and repair payload handling.
+
+Runtime-verified against kind plus the Compose data systems:
+
+```text
+Invariant generation 5 -> checker Jobs -> paid-orders-indexed drift detected
+operator found RepairPolicy reindex-missing-paid-orders
+operator created dataguard-repair-paid-orders-indexed-g5
+repair Job reindexed 8 missing paid orders
+repair Job verified paid-orders-indexed Healthy
+operator patched paid-orders-indexed status from repair ConfigMap
+
+fresh aggregate generation 6 -> Healthy
+restored default 60-second SLO generations -> both Healthy
+```
+
+This is now the first closed-loop version of KubeDataGuard:
+
+```text
+declare invariant -> detect drift -> run allowed repair -> verify -> update status
+```
+
+## Latest Failure Taxonomy Pass
+
+Implemented and verified now:
+
+- Added explicit repair result construction for Kubernetes repair Jobs.
+- Added unit coverage for:
+  - repair verification success -> `Healthy`
+  - repair verification still drifting -> `RepairFailed`
+  - checker Job failure status -> `CheckFailed`
+  - repair running status -> `Repairing`
+  - repair failure status -> `RepairFailed`
+- Runtime-verified checker failure:
+  - temporarily pointed `paid-orders-indexed` at an unreachable Postgres port
+  - checker Job failed before publishing a report
+  - operator set `Invariant.status.phase=CheckFailed`
+  - restored the real Postgres DSN and verified the next generation returned to `Healthy`
+- Runtime-verified repair verification failure:
+  - temporarily added an aggregate `RepairPolicy` using `reindex-records`
+  - created aggregate drift
+  - repair Job completed but verification still found aggregate mismatch
+  - repair Job published `phase=RepairFailed`
+  - operator copied `RepairFailed` into `Invariant.status`
+  - removed the temporary policy, repaired the data, restored the default 60-second SLO, and verified both invariants `Healthy`
+
+This hardens the control plane distinction:
+
+```text
+data drift != checker failure != repair failure
+```
+
+## Latest Bounded Freshness Pass
+
+Implemented and verified now:
+
+- Added `freshness` as a first-class invariant mode.
+- Added bounded freshness comparison logic:
+  - source `updated_at`
+  - target `indexed_at`
+  - observed lag seconds
+  - max lag seconds
+  - missing target evidence represented as freshness lag violation
+- Added CDC evidence fields:
+  - Postgres `pg_current_wal_lsn()` as `sourceLSN`
+  - source timestamp watermark
+  - Kafka topic offset start/end
+  - stream topic
+- Added `dataguard check --invariant freshness`.
+- Added Kubernetes `check-job --invariant freshness`.
+- Added `make check-freshness`.
+- Added `paid-orders-freshness` example `Invariant`.
+- Updated the Invariant CRD status schema with `observationWindow.sourceLSN`.
+- Updated Markdown report rendering for freshness violations and source LSN.
+- Updated Redpanda external advertised listener to `host.docker.internal:19092` so kind pods can read Kafka metadata/offsets.
+- Added unit tests for healthy and violating freshness reports.
+- Added Go test proving the operator passes `freshness` to checker Jobs.
+
+Runtime-verified:
+
+```text
+Compose freshness check:
+  status: Healthy
+  guarantee: boundedFreshness
+  sourceLSN present
+  Kafka offset range present
+
+kind operator freshness check:
+  Invariant: paid-orders-freshness
+  checkedRecords: 41
+  phase: Healthy
+  guarantee: boundedFreshness
+  sourceLSN: present
+  streamOffsetStart: 0
+  streamOffsetEnd: 250
+```
+
+## Latest Freshness Drift/Repair Pass
+
+Implemented the next phase: freshness is now intentionally breakable and repairable.
+
+New behavior:
+
+- Added `inject-freshness-drift`.
+- Added `make drift-freshness`.
+- Added `make demo-freshness-drift`.
+- Added `make repair-freshness`.
+- Local repair can now verify `existence`, `aggregate`, or `freshness`.
+- Repair now treats `freshness_violations` as source-of-truth reindex candidates.
+- Added an auto-approved freshness `RepairPolicy` to the example resources.
+- Split freshness evidence into:
+  - `freshness_violations`: current actionable drift
+  - `freshness_breaches`: historical bounded-freshness SLO misses
+
+Design reason:
+
+```text
+A late derived update proves the SLO was breached, but it should not keep the current Kubernetes status unhealthy forever after the derived view has caught up.
+```
+
+Current repair semantics:
+
+```text
+freshness violation order ids
+  -> fetch source rows from Postgres
+  -> reindex OpenSearch documents
+  -> verify paid-orders-freshness
+  -> preserve historical SLO breach evidence separately in the report
+```
+
+Runtime-verified:
+
+```text
+Compose:
+  make demo-freshness-drift -> DriftDetected, drift_count=5
+  make repair-freshness -> Healthy, drift_count=0, slo_breach_count=5
+
+kind operator:
+  paid-orders-freshness generation 4 checker -> DriftDetected, drift_count=5
+  generation 4 repair Job -> Healthy, drift_count=0, sloBreachCount=5
+  restored generation 5 maxLagSeconds=60 -> Healthy, checkedRecords=41, drift_count=0
+```
+
+## First Build Target
+
+Runtime-verify the local runnable demo:
+
+```text
+Postgres orders table
+Demo API/order generator
+Redpanda topic
+Indexer worker
+OpenSearch index
+Consistency checker
+Repair command
+```
+
+Invariant:
+
+```text
+Every paid order in Postgres must exist in OpenSearch within 60 seconds.
+```
+
+## Verification Completed
+
+- `PYTHONPATH=src python3 -m unittest discover -s tests`
+  - Passed: 15 tests
+- `go test ./...`
+  - Passed
+- `go build ./cmd/dataguard-operator`
+  - Passed
+- `python3 -m py_compile $(find src -name '*.py' | sort)`
+  - Passed
+- `PYTHONPATH=src python3 -m dataguard.cli demo-local --count 10 --skip-every-paid 5`
+  - Passed
+  - Detected 2 missing orders and 1 stale document
+  - Detected aggregate count and revenue mismatch
+  - Repaired 3 records from source truth
+  - Verified existence and aggregate invariants healthy
+- In-memory Markdown rendering for local proof report
+  - Passed
+- Ruby YAML parsing for Compose, CRDs, and examples
+  - Passed
+- `docker run --rm hello-world`
+  - Passed
+- `make up`
+  - Passed
+- `make init`
+  - Passed after replacing the protected `Documents` bind mount with `${HOME}/.kubedataguard/reports`
+- `make demo-drift`
+  - Passed
+  - Generated 50 orders
+  - Indexed 42 events
+  - Deliberately skipped 8 paid orders
+  - Existence check reported `DriftDetected` with 8 missing orders
+- `make check-aggregate`
+  - Passed before repair
+  - Reported aggregate count drift: source 41, target 33
+  - Reported aggregate revenue drift
+- `make demo-repair`
+  - Passed
+  - Repaired 8 missing orders
+  - Post-repair existence verification was `Healthy`
+- `make check-aggregate`
+  - Passed after repair
+  - Post-repair aggregate verification was `Healthy`
+- `kind create cluster --name kubedataguard --wait 180s`
+  - Passed
+- `kubectl apply -f k8s/crds`
+  - Passed
+- `kubectl apply -f examples/commerce-consistency.yaml`
+  - Passed
+- Local operator run against kind:
+  - Passed
+  - Reconciled sample invariants to `Healthy`
+  - Reconciled synthetic drift annotation to `DriftDetected`
+- `docker compose build dataguard`
+  - Passed
+- `kind load docker-image kubedataguard-dataguard:latest --name kubedataguard`
+  - Passed
+- Job-backed operator run against kind:
+  - Passed
+  - Created checker Jobs for `paid-orders-indexed` and `paid-orders-aggregate`
+  - Checker Jobs connected from kind to Compose Postgres, Redpanda, and OpenSearch through `host.docker.internal`
+  - Checker Jobs wrote `status.json` and `report.json` ConfigMaps
+  - Operator patched `Invariant.status` from ConfigMap reports
+  - Drifted data produced `DriftDetected`
+  - Repaired data produced `Healthy`
+- Repair-backed operator run against kind:
+  - Passed
+  - Drifted data triggered `dataguard-repair-paid-orders-indexed-g5`
+  - Repair Job reindexed 8 missing OpenSearch documents from Postgres
+  - Repair Job wrote `dataguard-repair-report-paid-orders-indexed-g5`
+  - Operator patched `paid-orders-indexed` to `Healthy`
+  - Fresh aggregate check after repair produced `Healthy`
+  - Restored default `maxLagSeconds=60` SLO and both invariants remained `Healthy`
+- Failure taxonomy run against kind:
+  - Passed
+  - Unreachable Postgres checker generation produced `CheckFailed`
+  - Restored checker generation produced `Healthy`
+  - Temporary aggregate reindex repair policy produced `RepairFailed` after verification still found drift
+  - Removed temporary policy and restored both invariants to `Healthy`
+- Bounded freshness run:
+  - Passed
+  - `make check-freshness` produced `Healthy` bounded-freshness report with `sourceLSN`
+  - kind operator created `dataguard-check-paid-orders-freshness-g3`
+  - `paid-orders-freshness` ended `Healthy` with 41 checked records
+  - status included `sourceLSN`, `sourceWatermark`, `streamOffsetStart`, and `streamOffsetEnd`
+- Freshness drift/repair run:
+  - Passed
+  - `make demo-freshness-drift` injected 5 current freshness violations
+  - `make repair-freshness` reindexed those 5 orders and verified freshness `Healthy`
+  - post-repair report preserved `slo_breach_count=5`
+  - kind operator generation 4 detected 5 freshness violations
+  - operator selected `reindex-stale-paid-orders`
+  - repair Job produced `Healthy`, `driftCount=0`, `sloBreachCount=5`
+  - restored generation 5 default SLO produced `Healthy`, `checkedRecords=41`, `driftCount=0`
+
+## Verification Not Completed
+
+- A Kubernetes-native Postgres/Redpanda/OpenSearch demo stack has not been added yet; the current kind proof reaches the Compose services through `host.docker.internal`.
+- Source-of-truth reindex repair is implemented for existence and freshness drift. Broader repair strategies such as Kafka replay, cache invalidation, and aggregate backfill are not implemented yet.
+- Secrets are still represented by CRD sketches and annotations/defaults for the demo; production-grade Secret wiring is not implemented yet.
+
+## Intermediate Roadmap Before Mature Operator
+
+Do not jump directly from Compose verification to a full controller. Build these layers first:
+
+1. Runtime-verify the local demo.
+   - No-Docker proof: implemented and verified.
+   - Compose proof: implemented and verified with Postgres, Redpanda, OpenSearch, drift detection, aggregate detection, and repair.
+   - Runtime wiring issue found and fixed: Colima cannot bind-mount the protected macOS `Documents` path, so reports are mounted from `${HOME}/.kubedataguard/reports`.
+
+2. Stabilize report persistence.
+   - For the local CLI, keep writing JSON/Markdown reports.
+   - For Compose on this machine, reports are written through `${HOME}/.kubedataguard/reports:/workspace/reports`.
+   - For Kubernetes, store summary fields in the `Invariant.status` subresource:
+     - `healthy`
+     - `phase`
+     - `guarantee`
+     - `checkStatus`
+     - `driftCount`
+     - `lastCheckedAt`
+     - `observationWindow`
+     - `counterexampleCount`
+     - `reportRef`
+     - `observedGeneration`
+
+3. Expand second invariant type: aggregate check.
+   - Implemented: paid order count and paid revenue total in Postgres must match OpenSearch aggregation.
+   - Next: add aggregate-specific drift scenarios and repair guidance.
+
+4. Add failure taxonomy tests.
+   - Simulate source unavailable, target unavailable, checker crash, repair retry, duplicate repair, stale target document, and corrupted target document.
+
+5. Add lag-aware freshness.
+   - Track source `updated_at`, event publish time, index time, and observed lag.
+   - This maps directly to DDIA replication lag and becomes the more academic invariant.
+
+6. Add a second source/derived pair.
+   - Recommended: Postgres -> Redis cache freshness, or Postgres -> ClickHouse aggregate table.
+   - Purpose: prove `DataSource`, `DerivedView`, `Invariant`, and `RepairPolicy` are real abstractions, not accidental names for the OpenSearch demo.
+
+7. Build the Kubernetes controller.
+   - Initial synthetic reconciler: implemented.
+   - Job-backed checker reconciliation: implemented and runtime-verified.
+   - Repair Job reconciliation from `RepairPolicy`: implemented and runtime-verified for `reindex-records`.
+   - Next: emit metrics and events.
+
+## Research-Backed Model Upgrades
+
+The paper set changes the project from a useful demo into a credible data-correctness control plane.
+
+### CDC Evidence
+
+DBLog makes watermarks and replay boundaries non-optional for the mature design.
+
+Add these fields to reports before the controller phase:
+
+- `sourceWatermark`
+- `sourceSnapshotStartedAt`
+- `sourceSnapshotFinishedAt`
+- `streamTopic`
+- `streamPartition`
+- `streamOffset`
+- `consumerGroup`
+- `observedLagSeconds`
+- `replayScope`
+
+These fields let the project prove which part of source history was checked or repaired.
+
+### Consistency Semantics
+
+The consistency-model papers imply that each invariant should name its guarantee:
+
+- `existence`
+- `fieldEquality`
+- `aggregate`
+- `boundedFreshness`
+- `readYourWrites`
+- `monotonicReads`
+- `causalVisibility`
+
+The local MVP should implement them in this order:
+
+1. `existence`
+2. `aggregate`
+3. `boundedFreshness`
+4. session/client guarantees later
+
+### Counterexample Reports
+
+Elle implies that failed checks should produce a small, explanatory counterexample history.
+
+For KubeDataGuard, that means a violation should include:
+
+- the source row id and version
+- the source commit or update time
+- the event topic and offset if available
+- the expected derived key
+- the observed derived state
+- the exact SLO window that was violated
+
+### Spec/Status Discipline
+
+GITER and the Kubernetes operator pattern reinforce this split:
+
+- `spec`: desired data-correctness promise
+- `status`: compact observed truth
+- external report: durable evidence and counterexamples
+- repair policy: allowed reconciliation action
+
+## Failure Taxonomy
+
+KubeDataGuard must be correct about its own behavior before it can credibly monitor data correctness.
+
+### Pipeline/Data Failures
+
+- Missing derived record: source row exists but target document is absent.
+- Stale derived record: target document exists but fields differ from source.
+- Duplicate derived record: target has more than one representation for a business key.
+- Aggregate mismatch: counts or totals differ between source and derived stores.
+- Replication lag: target is behind beyond the declared SLO.
+- Schema/mapping rejection: target rejects a record due to incompatible field shape.
+
+### Checker Failures
+
+- Source unavailable during scan.
+- Target unavailable during scan.
+- Checker crashes mid-scan.
+- Partial scan produces an incomplete report.
+- Slow scan exceeds the check interval.
+- Credentials or Kubernetes Secret are missing/rotated.
+
+Expected behavior:
+
+- Do not mark the invariant healthy from an incomplete check.
+- Record check failure separately from data drift.
+- Preserve the previous known-good status until a complete check finishes.
+- Emit enough error detail for a human to distinguish "checker failed" from "data is inconsistent."
+
+### Repair Failures
+
+- Repair action crashes midway.
+- Repair writes duplicate documents.
+- Repair updates target from stale source data.
+- Repair succeeds but verification still fails.
+- Repair loops repeatedly without reducing drift.
+
+Expected behavior:
+
+- Repairs must be idempotent.
+- Every repair must be followed by verification.
+- Failed repair should update status and stop before uncontrolled retries.
+- High-risk repairs should eventually require approval.
+
+## Next Actions
+
+1. Expand failure taxonomy coverage:
+   - target unavailable
+   - checker timeout
+   - repair Job crash before report publication
+   - repair retry/idempotency
+   - stale/corrupt target document
+2. Replace annotation/default connection settings with Kubernetes Secret references.
+3. Build a Kubernetes-native demo stack so kind does not depend on Compose services.
+4. Add repair strategies beyond source-of-truth reindexing:
+   - Kafka replay
+   - Redis invalidation
+   - ClickHouse aggregate backfill
+5. Add a second source/derived pair to prove the CRD abstraction beyond OpenSearch.
+
+## Open Questions
+
+### Blocking
+
+Current answer:
+
+- Store compact truth in `Invariant.status`.
+- Store verbose JSON/Markdown reports externally.
+- First controller implementation uses `reportRef=configmap://namespace/name/report.json`.
+- Current repair provenance is stored in the repair result ConfigMap.
+- Next blocking decision: how much repair provenance should also be summarized in `Invariant.status`.
+
+### Next Sprint
+
+- What is the next invariant type?
+
+Current answer:
+
+- Aggregate checks are now implemented for paid-order count and revenue total.
+- Add lag-aware freshness next because it maps directly to DDIA replication lag and the report evidence model.
+- After freshness, add session/client guarantees only if the demo can capture per-client histories.
+
+### Future
+
+- Should the first full operator be Go/controller-runtime or Python/Kopf?
+
+Closed answer:
+
+- Use Go/controller-runtime for the real operator.
+- Keep Python for the local demo and fast invariant experimentation.
+
+## Knowledge Checkpoint
+
+The important idea to preserve:
+
+```text
+KubeDataGuard is not monitoring uptime. It is monitoring whether derived data is still correct relative to declared consistency SLOs.
+```

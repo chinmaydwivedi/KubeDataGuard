@@ -1,0 +1,52 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: repairpolicies.dataguard.io
+spec:
+  group: dataguard.io
+  scope: Namespaced
+  names:
+    plural: repairpolicies
+    singular: repairpolicy
+    kind: RepairPolicy
+    shortNames:
+      - rpol
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - invariantRef
+                - actions
+              properties:
+                invariantRef:
+                  type: string
+                approvalRequired:
+                  type: boolean
+                  default: true
+                actions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                    properties:
+                      type:
+                        type: string
+                        enum: ["reindex-records", "replay-kafka", "invalidate-cache", "run-job"]
+                      batchSize:
+                        type: integer
+                      topic:
+                        type: string
+                      jobTemplateRef:
+                        type: string
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+

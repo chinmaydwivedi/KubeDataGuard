@@ -1,0 +1,54 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: derivedviews.dataguard.io
+spec:
+  group: dataguard.io
+  scope: Namespaced
+  names:
+    plural: derivedviews
+    singular: derivedview
+    kind: DerivedView
+    shortNames:
+      - dview
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - sourceRef
+                - target
+              properties:
+                sourceRef:
+                  type: string
+                target:
+                  type: object
+                  required:
+                    - type
+                    - connectionSecret
+                  properties:
+                    type:
+                      type: string
+                    connectionSecret:
+                      type: string
+                    index:
+                      type: string
+                    table:
+                      type: string
+                pipeline:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                    topic:
+                      type: string
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+

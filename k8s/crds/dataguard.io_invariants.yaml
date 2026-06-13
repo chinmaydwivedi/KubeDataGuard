@@ -1,0 +1,108 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: invariants.dataguard.io
+spec:
+  group: dataguard.io
+  scope: Namespaced
+  names:
+    plural: invariants
+    singular: invariant
+    kind: Invariant
+    shortNames:
+      - inv
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Healthy
+          type: string
+          jsonPath: .status.healthy
+        - name: Status
+          type: string
+          jsonPath: .status.phase
+        - name: Drift
+          type: integer
+          jsonPath: .status.driftCount
+        - name: Guarantee
+          type: string
+          jsonPath: .status.guarantee
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - derivedViewRef
+                - type
+              properties:
+                derivedViewRef:
+                  type: string
+                type:
+                  type: string
+                  enum: ["existence", "fieldEquality", "count", "checksum", "freshness", "aggregate"]
+                maxLagSeconds:
+                  type: integer
+                  minimum: 0
+                  default: 60
+                sourceQuery:
+                  type: string
+                targetQuery:
+                  type: string
+                severity:
+                  type: string
+                  enum: ["info", "warning", "critical"]
+                  default: "warning"
+            status:
+              type: object
+              properties:
+                healthy:
+                  type: boolean
+                phase:
+                  type: string
+                  enum: ["Healthy", "DriftDetected", "CheckFailed", "Repairing", "RepairFailed", "Unknown"]
+                guarantee:
+                  type: string
+                checkStatus:
+                  type: string
+                  enum: ["complete", "partial", "failed", "timedOut"]
+                driftCount:
+                  type: integer
+                checkedRecords:
+                  type: integer
+                lastCheckedAt:
+                  type: string
+                observationWindow:
+                  type: object
+                  properties:
+                    checkedAt:
+                      type: string
+                    targetReadAt:
+                      type: string
+                    maxLagSeconds:
+                      type: integer
+                    eligibleRecordsBefore:
+                      type: string
+                    sourceWatermark:
+                      type: string
+                    sourceLSN:
+                      type: string
+                    streamTopic:
+                      type: string
+                    streamOffsetStart:
+                      type: integer
+                    streamOffsetEnd:
+                      type: integer
+                    completeness:
+                      type: string
+                counterexampleCount:
+                  type: integer
+                reportRef:
+                  type: string
+                observedGeneration:
+                  type: integer
+              x-kubernetes-preserve-unknown-fields: true
