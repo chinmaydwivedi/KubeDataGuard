@@ -700,6 +700,3 @@ Expected behavior:
 - Multi-tenant invariant isolation
 - "Explain drift" page that shows likely root cause
 
-## Why This Is Portfolio-Worthy
-
-KubeDataGuard is novel because it treats data correctness as a Kubernetes-managed desired state. It is not only DevOps, not only data engineering, and not only distributed systems theory. It combines all three in a way that maps directly to real production pain.
