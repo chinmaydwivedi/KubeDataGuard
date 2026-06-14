@@ -123,6 +123,7 @@ def emit_redis_invalidation_requests(settings: Settings, order_ids: list[str]) -
 def emit_clickhouse_backfill_request(settings: Settings, order_ids: list[str]) -> dict[str, Any]:
     table = os.getenv("CLICKHOUSE_BACKFILL_TABLE", "orders_analytics")
     partition_hint = os.getenv("CLICKHOUSE_BACKFILL_PARTITION", "")
+    execute_backfill = os.getenv("CLICKHOUSE_BACKFILL_EXECUTE", "").lower() in {"1", "true", "yes"}
     report_dir = Path(getattr(settings, "report_dir", "."))
     report_dir.mkdir(parents=True, exist_ok=True)
     request_path = report_dir / f"clickhouse-backfill-{int(time.time())}.json"
@@ -132,16 +133,26 @@ def emit_clickhouse_backfill_request(settings: Settings, order_ids: list[str]) -
         "table": table,
         "partition_hint": partition_hint or None,
         "ids": order_ids,
+        "scope": "ids" if order_ids else "full-paid-orders",
         "reason": "kubedataguard-drift",
     }
     request_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    return {
+
+    result = {
         "candidate_order_ids": order_ids,
         "repair_mode": CLICKHOUSE_BACKFILL,
         "requested": len(order_ids),
         "backfillRef": f"file://{request_path}",
         "table": table,
+        "scope": payload["scope"],
     }
+    if execute_backfill:
+        analytics = import_module("dataguard.analytics")
+        result["executed"] = analytics.backfill_orders_analytics(
+            settings,
+            order_ids or None,
+        )
+    return result
 
 
 def emit_request_file(

@@ -252,6 +252,45 @@ func TestResolveCheckerEnvUsesRedisDerivedViewSecretRefs(t *testing.T) {
 	}
 }
 
+func TestResolveCheckerEnvUsesClickHouseDerivedViewSecretRefs(t *testing.T) {
+	invariant := invariantObject("paid-orders-clickhouse-aggregate", "clickhouse-aggregate", nil)
+	setInvariantDerivedViewRef(invariant, "orders-clickhouse-analytics")
+	dataSource := dataSourceObject("orders-postgres", "postgres", "orders-postgres-secret", nil)
+	derivedView := derivedViewObject(
+		"orders-clickhouse-analytics",
+		"orders-postgres",
+		map[string]any{
+			"target": map[string]any{
+				"type":             "clickhouse",
+				"connectionSecret": "orders-clickhouse-secret",
+				"database":         "analytics",
+				"table":            "paid_orders",
+			},
+		},
+	)
+	reconciler := &InvariantReconciler{
+		Client: fake.NewClientBuilder().
+			WithObjects(invariant, dataSource, derivedView).
+			Build(),
+	}
+
+	env, err := reconciler.resolveCheckerEnv(context.Background(), invariant)
+	if err != nil {
+		t.Fatalf("resolveCheckerEnv returned error: %v", err)
+	}
+
+	envMap := envByName(env)
+	assertSecretEnv(t, envMap["CLICKHOUSE_URL"], "orders-clickhouse-secret", "url")
+	assertSecretEnv(t, envMap["CLICKHOUSE_USER"], "orders-clickhouse-secret", "user")
+	assertSecretEnv(t, envMap["CLICKHOUSE_PASSWORD"], "orders-clickhouse-secret", "password")
+	if envMap["CLICKHOUSE_DATABASE"].Value != "analytics" {
+		t.Fatalf("CLICKHOUSE_DATABASE = %q, want analytics", envMap["CLICKHOUSE_DATABASE"].Value)
+	}
+	if envMap["CLICKHOUSE_TABLE"].Value != "paid_orders" {
+		t.Fatalf("CLICKHOUSE_TABLE = %q, want paid_orders", envMap["CLICKHOUSE_TABLE"].Value)
+	}
+}
+
 func TestInvariantsForDerivedViewEnqueuesOnlyReferencingInvariants(t *testing.T) {
 	indexed := invariantObject("paid-orders-indexed", "existence", nil)
 	freshness := invariantObject("paid-orders-freshness", "freshness", nil)
@@ -398,6 +437,29 @@ func TestBuildCheckerJobPassesFreshnessInvariantToWorker(t *testing.T) {
 	args := job.Spec.Template.Spec.Containers[0].Args
 	if !contains(args, "--invariant") || !contains(args, "freshness") {
 		t.Fatalf("checker job args do not select freshness: %#v", args)
+	}
+}
+
+func TestBuildCheckerJobPassesChecksumInvariantConfigurationToWorker(t *testing.T) {
+	invariant := invariantObject("paid-orders-checksum", "checksum", nil)
+	spec := invariant.Object["spec"].(map[string]any)
+	spec["checksumPrefixLength"] = int64(3)
+
+	job, err := BuildCheckerJob(invariant, CheckRun{ID: "g3"})
+	if err != nil {
+		t.Fatalf("BuildCheckerJob returned error: %v", err)
+	}
+
+	args := job.Spec.Template.Spec.Containers[0].Args
+	for _, want := range []string{
+		"--invariant",
+		"checksum",
+		"--checksum-prefix-length",
+		"3",
+	} {
+		if !contains(args, want) {
+			t.Fatalf("checksum checker args do not contain %q: %#v", want, args)
+		}
 	}
 }
 

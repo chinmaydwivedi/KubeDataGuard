@@ -44,7 +44,7 @@ spec:
                   type: string
                 type:
                   type: string
-                  enum: ["existence", "fieldEquality", "count", "checksum", "freshness", "redis-freshness", "aggregate", "query"]
+                  enum: ["existence", "fieldEquality", "count", "checksum", "freshness", "redis-freshness", "clickhouse-aggregate", "aggregate", "query"]
                 checkIntervalSeconds:
                   type: integer
                   minimum: 0
@@ -67,6 +67,11 @@ spec:
                   type: integer
                   minimum: 0
                   default: 0
+                checksumPrefixLength:
+                  type: integer
+                  minimum: 1
+                  maximum: 12
+                  default: 1
                 compareFields:
                   type: array
                   items:
@@ -123,6 +128,9 @@ spec:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
                     sourceScan:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    checksumTree:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
                     completeness:

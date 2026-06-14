@@ -62,6 +62,7 @@ const (
 	DefaultOpenSearchSecretKey   = "url"
 	DefaultKafkaSecretKey        = "bootstrapServers"
 	DefaultRedisSecretKey        = "url"
+	DefaultClickHouseSecretKey   = "url"
 )
 
 type CheckRun struct {
@@ -901,11 +902,25 @@ func applyDerivedViewEnv(env []corev1.EnvVar, derivedView *unstructured.Unstruct
 		secretKey := nestedStringOrDefault(derivedView, DefaultRedisSecretKey, "spec", "target", "connectionSecretKey")
 		env = upsertEnvVar(env, secretEnvVar("REDIS_URL", targetSecret, secretKey))
 	}
+	if targetType == "clickhouse" && targetSecret != "" {
+		secretKey := nestedStringOrDefault(derivedView, DefaultClickHouseSecretKey, "spec", "target", "connectionSecretKey")
+		env = upsertEnvVar(env, secretEnvVar("CLICKHOUSE_URL", targetSecret, secretKey))
+		userKey := nestedStringOrDefault(derivedView, "user", "spec", "target", "userKey")
+		passwordKey := nestedStringOrDefault(derivedView, "password", "spec", "target", "passwordKey")
+		env = upsertEnvVar(env, secretEnvVar("CLICKHOUSE_USER", targetSecret, userKey))
+		env = upsertEnvVar(env, secretEnvVar("CLICKHOUSE_PASSWORD", targetSecret, passwordKey))
+	}
 	if index, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "index"); index != "" {
 		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDERS_INDEX", Value: index})
 	}
 	if keyPrefix, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "keyPrefix"); keyPrefix != "" {
 		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDER_CACHE_PREFIX", Value: keyPrefix})
+	}
+	if table, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "table"); table != "" {
+		env = upsertEnvVar(env, corev1.EnvVar{Name: "CLICKHOUSE_TABLE", Value: table})
+	}
+	if database, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "database"); database != "" {
+		env = upsertEnvVar(env, corev1.EnvVar{Name: "CLICKHOUSE_DATABASE", Value: database})
 	}
 	if topic, _, _ := unstructured.NestedString(derivedView.Object, "spec", "pipeline", "topic"); topic != "" {
 		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDER_EVENTS_TOPIC", Value: topic})
@@ -958,6 +973,11 @@ func checkerEnv(invariant *unstructured.Unstructured) []corev1.EnvVar {
 		{Name: "ORDERS_INDEX", Value: annotationOrDefault(invariant, AnnotationOrdersIndex, DefaultOrdersIndex)},
 		{Name: "REDIS_URL", Value: annotationOrDefault(invariant, "dataguard.io/redis-url", "redis://host.docker.internal:6379/0")},
 		{Name: "ORDER_CACHE_PREFIX", Value: annotationOrDefault(invariant, "dataguard.io/order-cache-prefix", "order")},
+		{Name: "CLICKHOUSE_URL", Value: annotationOrDefault(invariant, "dataguard.io/clickhouse-url", "http://host.docker.internal:8123")},
+		{Name: "CLICKHOUSE_USER", Value: annotationOrDefault(invariant, "dataguard.io/clickhouse-user", "dataguard")},
+		{Name: "CLICKHOUSE_PASSWORD", Value: annotationOrDefault(invariant, "dataguard.io/clickhouse-password", "dataguard")},
+		{Name: "CLICKHOUSE_DATABASE", Value: annotationOrDefault(invariant, "dataguard.io/clickhouse-database", "dataguard")},
+		{Name: "CLICKHOUSE_TABLE", Value: annotationOrDefault(invariant, "dataguard.io/clickhouse-table", "orders_analytics")},
 		{Name: "REPORT_DIR", Value: DefaultReportDir},
 		{Name: "REPORT_STORE", Value: annotationOrDefault(invariant, AnnotationReportStore, DefaultReportStore)},
 		{Name: "REPORT_BUCKET", Value: annotationOrDefault(invariant, AnnotationReportBucket, "")},
@@ -977,16 +997,24 @@ func checkerInvariantArg(invariant *unstructured.Unstructured) string {
 		return "query"
 	case "aggregate":
 		return "aggregate"
+	case "checksum":
+		return "checksum"
 	case "freshness":
 		return "freshness"
 	case "redis-freshness":
 		return "redis-freshness"
+	case "clickhouse-aggregate":
+		return "clickhouse-aggregate"
 	default:
 		return "existence"
 	}
 }
 
 func appendQueryArgs(args []string, invariant *unstructured.Unstructured) []string {
+	if checkerInvariantArg(invariant) == "checksum" {
+		args = append(args, "--checksum-prefix-length", strconv.FormatInt(checksumPrefixLength(invariant), 10))
+		return args
+	}
 	if checkerInvariantArg(invariant) != "query" {
 		return args
 	}
@@ -1088,6 +1116,17 @@ func sourceScanPageSize(invariant *unstructured.Unstructured) int64 {
 	}
 	if value > 5000 {
 		return 5000
+	}
+	return value
+}
+
+func checksumPrefixLength(invariant *unstructured.Unstructured) int64 {
+	value, found, _ := unstructured.NestedInt64(invariant.Object, "spec", "checksumPrefixLength")
+	if !found || value < 1 {
+		return 1
+	}
+	if value > 12 {
+		return 12
 	}
 	return value
 }

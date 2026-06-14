@@ -11,6 +11,7 @@ from .invariants import (
     CHECK_COMPLETE,
     DriftReport,
     compare_paid_order_aggregates,
+    compare_paid_order_checksum_buckets,
     compare_paid_order_freshness,
     compare_paid_orders_to_index,
     compare_query_results,
@@ -89,6 +90,126 @@ def check_paid_orders_aggregate(
         stream_offset_end=offsets["stream_offset_end"],
         source_lsn=source_lsn,
         cdc_frontier=cdc_frontier,
+    )
+
+
+def check_paid_orders_checksum(
+    settings: Settings,
+    *,
+    max_lag_seconds: int,
+    prefix_length: int = 1,
+) -> DriftReport:
+    from . import merkle
+
+    checked_at = datetime.now(timezone.utc)
+    offsets = stream_offsets(settings)
+    eligible_before = checked_at - timedelta(seconds=max_lag_seconds)
+    source_buckets = db.paid_order_bucket_summaries(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        prefix_length=prefix_length,
+    )
+    source_lsn = source_lsn_or_none(settings)
+    target_buckets = search.paid_order_bucket_summaries(
+        settings,
+        updated_before=iso(eligible_before),
+        prefix_length=prefix_length,
+    )
+    _source_summary, _target_summary, bucket_mismatches = merkle.compare_bucket_summaries(
+        source_buckets,
+        target_buckets,
+    )
+    mismatch_prefixes = merkle.mismatched_bucket_keys(bucket_mismatches)
+    source_rows = db.fetch_paid_orders_by_id_prefix(
+        settings,
+        mismatch_prefixes,
+        prefix_length=prefix_length,
+        max_lag_seconds=max_lag_seconds,
+    )
+    target_rows = search.fetch_paid_orders_by_id_prefix(
+        settings,
+        mismatch_prefixes,
+        updated_before=iso(eligible_before),
+        prefix_length=prefix_length,
+    )
+    target_read_at = datetime.now(timezone.utc)
+    cdc_frontier = build_check_cdc_frontier(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        source_lsn=source_lsn,
+        source_watermark=latest_bucket_watermark(source_buckets),
+        offsets=offsets,
+        target_read_at=target_read_at,
+    )
+    return compare_paid_order_checksum_buckets(
+        source_buckets=source_buckets,
+        target_buckets=target_buckets,
+        source_rows=source_rows,
+        target_rows=target_rows,
+        prefix_length=prefix_length,
+        max_lag_seconds=max_lag_seconds,
+        checked_at=checked_at,
+        target_read_at=target_read_at,
+        stream_topic=settings.order_events_topic,
+        stream_offset_start=offsets["stream_offset_start"],
+        stream_offset_end=offsets["stream_offset_end"],
+        source_lsn=source_lsn,
+        cdc_frontier=cdc_frontier,
+    )
+
+
+def check_paid_orders_clickhouse_aggregate(
+    settings: Settings,
+    *,
+    max_lag_seconds: int,
+) -> DriftReport:
+    from . import analytics
+
+    checked_at = datetime.now(timezone.utc)
+    offsets = stream_offsets(settings)
+    source_summary = db.fetch_paid_order_summary(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+    )
+    source_lsn = source_lsn_or_none(settings)
+    target_summary = analytics.paid_order_summary(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+    )
+    target_read_at = datetime.now(timezone.utc)
+    cdc_frontier = build_check_cdc_frontier(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        source_lsn=source_lsn,
+        source_watermark=source_summary.get("source_watermark"),
+        offsets=offsets,
+        target_read_at=target_read_at,
+        target_frontier={
+            "system": "clickhouse",
+            "table": f"{settings.clickhouse_database}.{settings.clickhouse_table}",
+            "available": True,
+            "frontier_kind": "analytics-summary",
+        },
+    )
+    report = compare_paid_order_aggregates(
+        source_summary,
+        target_summary,
+        max_lag_seconds=max_lag_seconds,
+        checked_at=checked_at,
+        target_read_at=target_read_at,
+        stream_topic=settings.order_events_topic,
+        stream_offset_start=offsets["stream_offset_start"],
+        stream_offset_end=offsets["stream_offset_end"],
+        source_lsn=source_lsn,
+        cdc_frontier=cdc_frontier,
+    )
+    return DriftReport(
+        invariant="paid-orders-clickhouse-aggregate",
+        checked_records=report.checked_records,
+        aggregate_mismatches=report.aggregate_mismatches,
+        guarantee="analyticsAggregate",
+        observation_window=report.observation_window,
+        check_status=report.check_status,
     )
 
 
@@ -287,6 +408,13 @@ def check_query_invariant(
 def scan_query_hash(*, source_query: str, target_query: str, key_field: str) -> str:
     payload = "\n".join([source_query.strip(), target_query.strip(), key_field.strip()])
     return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def latest_bucket_watermark(buckets: list[dict[str, Any]]) -> str | None:
+    values = [str(bucket["source_watermark"]) for bucket in buckets if bucket.get("source_watermark")]
+    if not values:
+        return None
+    return max(values)
 
 
 def stream_offsets(settings: Settings) -> dict[str, Any]:

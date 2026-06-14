@@ -166,6 +166,99 @@ def paid_order_summary(
     }
 
 
+def paid_order_bucket_summaries(
+    settings: Settings,
+    *,
+    updated_before: str | None = None,
+    prefix_length: int = 1,
+    max_buckets: int = 65536,
+) -> list[dict[str, Any]]:
+    prefix_length = bounded_prefix_length(prefix_length)
+    filters: list[dict[str, Any]] = [{"term": {"status": "paid"}}]
+    if updated_before:
+        filters.append({"range": {"updated_at": {"lte": updated_before}}})
+
+    response = client(settings).search(
+        index=settings.orders_index,
+        body={
+            "size": 0,
+            "query": {"bool": {"filter": filters}},
+            "aggs": {
+                "id_prefixes": {
+                    "terms": {
+                        "script": id_prefix_script(prefix_length),
+                        "size": max_buckets,
+                    },
+                    "aggs": {
+                        "total_amount_cents": {"sum": {"field": "amount_cents"}},
+                        "version_sum": {"sum": {"field": "version"}},
+                    },
+                }
+            },
+        },
+    )
+
+    buckets = response.get("aggregations", {}).get("id_prefixes", {}).get("buckets", [])
+    summaries: list[dict[str, Any]] = []
+    for bucket in buckets:
+        summaries.append(
+            {
+                "bucket": str(bucket["key"]),
+                "count": int(bucket.get("doc_count") or 0),
+                "total_amount_cents": int(bucket.get("total_amount_cents", {}).get("value") or 0),
+                "version_sum": int(bucket.get("version_sum", {}).get("value") or 0),
+                "source_watermark": None,
+            }
+        )
+    return sorted(summaries, key=lambda item: item["bucket"])
+
+
+def fetch_paid_orders_by_id_prefix(
+    settings: Settings,
+    prefixes: Iterable[str],
+    *,
+    updated_before: str | None = None,
+    prefix_length: int = 1,
+    page_size: int = DEFAULT_TARGET_QUERY_PAGE_SIZE,
+) -> list[dict[str, Any]]:
+    prefix_list = sorted({str(prefix) for prefix in prefixes if str(prefix)})
+    if not prefix_list:
+        return []
+    prefix_length = bounded_prefix_length(prefix_length)
+    filters: list[dict[str, Any]] = [
+        {"term": {"status": "paid"}},
+        {
+            "script": {
+                "script": {
+                    "lang": "painless",
+                    "source": (
+                        "if (doc['id'].size() == 0) { return false; } "
+                        "int prefixLength = (int) params.prefix_length; "
+                        "String value = doc['id'].value; "
+                        "String bucket = value.length() <= prefixLength ? value : value.substring(0, prefixLength); "
+                        "for (String prefix : params.prefixes) { "
+                        "  if (bucket == prefix) { return true; } "
+                        "} "
+                        "return false;"
+                    ),
+                    "params": {"prefixes": prefix_list, "prefix_length": prefix_length},
+                }
+            }
+        },
+    ]
+    if updated_before:
+        filters.append({"range": {"updated_at": {"lte": updated_before}}})
+
+    body = {
+        "query": {"bool": {"filter": filters}},
+        "sort": [
+            {"id": {"order": "asc", "unmapped_type": "keyword"}},
+            {"_id": {"order": "asc"}},
+        ],
+    }
+    return paginated_search(settings, body, page_size=page_size)
+
+
 def target_offset_frontier(settings: Settings) -> dict[str, Any]:
     os_client = client(settings)
     response = os_client.search(
@@ -240,6 +333,16 @@ def execute_target_query(
     page_size = bounded_page_size(body.pop("size", page_size))
     ensure_search_after_sort(body, key_field=key_field)
 
+    return paginated_search(settings, body, page_size=page_size, key_field=key_field)
+
+
+def paginated_search(
+    settings: Settings,
+    body: dict[str, Any],
+    *,
+    page_size: int,
+    key_field: str = "id",
+) -> list[dict[str, Any]]:
     os_client = client(settings)
     rows: list[dict[str, Any]] = []
     search_after: list[Any] | None = None
@@ -275,6 +378,30 @@ def bounded_page_size(value: Any) -> int:
     if parsed < 1:
         raise ValueError("target query page size must be at least 1")
     return min(parsed, MAX_TARGET_QUERY_PAGE_SIZE)
+
+
+def bounded_prefix_length(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checksum prefix length must be an integer") from exc
+    if parsed < 1:
+        raise ValueError("checksum prefix length must be at least 1")
+    return min(parsed, 12)
+
+
+def id_prefix_script(prefix_length: int) -> dict[str, Any]:
+    return {
+        "lang": "painless",
+        "source": (
+            "if (doc['id'].size() == 0) { return ''; } "
+            "int prefixLength = (int) params.prefix_length; "
+            "String value = doc['id'].value; "
+            "int size = value.length() <= prefixLength ? value.length() : prefixLength; "
+            "return value.substring(0, size);"
+        ),
+        "params": {"prefix_length": prefix_length},
+    }
 
 
 def ensure_search_after_sort(body: dict[str, Any], *, key_field: str) -> None:

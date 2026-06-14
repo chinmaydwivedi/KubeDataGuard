@@ -243,6 +243,76 @@ def fetch_paid_order_summary(settings: Settings, max_lag_seconds: int) -> dict[s
     }
 
 
+def paid_order_bucket_summaries(
+    settings: Settings,
+    *,
+    max_lag_seconds: int,
+    prefix_length: int,
+) -> list[dict[str, Any]]:
+    prefix_length = bounded_prefix_length(prefix_length)
+    with connect(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select
+                  left(id::text, %s) as bucket,
+                  count(*)::integer as count,
+                  coalesce(sum(amount_cents), 0)::bigint as total_amount_cents,
+                  coalesce(sum(version), 0)::bigint as version_sum,
+                  max(updated_at) as source_watermark
+                from orders
+                where status = 'paid'
+                  and updated_at <= now() - make_interval(secs => %s)
+                group by bucket
+                order by bucket asc
+                """,
+                (prefix_length, max_lag_seconds),
+            )
+            rows = cur.fetchall()
+
+    return [
+        {
+            "bucket": str(row["bucket"]),
+            "count": int(row["count"]),
+            "total_amount_cents": int(row["total_amount_cents"]),
+            "version_sum": int(row["version_sum"]),
+            "source_watermark": (
+                _iso(row["source_watermark"])
+                if row["source_watermark"] is not None
+                else None
+            ),
+        }
+        for row in rows
+    ]
+
+
+def fetch_paid_orders_by_id_prefix(
+    settings: Settings,
+    prefixes: Iterable[str],
+    *,
+    prefix_length: int,
+    max_lag_seconds: int,
+) -> list[dict[str, Any]]:
+    prefix_list = sorted({str(prefix) for prefix in prefixes if str(prefix)})
+    if not prefix_list:
+        return []
+    prefix_length = bounded_prefix_length(prefix_length)
+    with connect(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select *
+                from orders
+                where status = 'paid'
+                  and updated_at <= now() - make_interval(secs => %s)
+                  and left(id::text, %s) = any(%s::text[])
+                order by id asc
+                """,
+                (max_lag_seconds, prefix_length, prefix_list),
+            )
+            return [serialize_order(row) for row in cur.fetchall()]
+
+
 def current_wal_lsn(settings: Settings) -> str:
     with connect(settings) as conn:
         with conn.cursor() as cur:
@@ -492,6 +562,16 @@ def bounded_source_scan_page_size(value: Any) -> int:
     if parsed < 1:
         raise ValueError("source scan page size must be at least 1")
     return min(parsed, MAX_SOURCE_SCAN_PAGE_SIZE)
+
+
+def bounded_prefix_length(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checksum prefix length must be an integer") from exc
+    if parsed < 1:
+        raise ValueError("checksum prefix length must be at least 1")
+    return min(parsed, 12)
 
 
 def normalized_source_query(query: str) -> str:

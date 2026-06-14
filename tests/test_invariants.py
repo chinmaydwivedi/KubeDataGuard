@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 from dataguard.invariants import (
     compare_paid_order_aggregates,
+    compare_paid_order_checksum_buckets,
     compare_paid_order_freshness,
     compare_paid_orders_to_index,
     compare_query_results,
@@ -24,6 +25,7 @@ from dataguard.checkpoints import (
 )
 from dataguard.db import execute_source_query_keyset
 from dataguard.local_demo import run_local_proof
+from dataguard.merkle import compare_bucket_summaries, summarize_rows_by_prefix
 from dataguard.observability import prometheus_metrics
 from dataguard.repair import repair_from_payload
 from dataguard.reporting import write_report_artifacts
@@ -246,6 +248,64 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         fields = {item["field"] for item in report.aggregate_mismatches}
         self.assertEqual(fields, {"count", "total_amount_cents"})
         self.assertEqual(report.counterexamples[0]["type"], "aggregate_mismatch")
+
+    def test_checksum_buckets_narrow_to_mismatched_prefixes(self):
+        source_rows = [
+            {
+                "id": "a-order-1",
+                "status": "paid",
+                "amount_cents": 1200,
+                "currency": "USD",
+                "version": 1,
+                "updated_at": "2026-06-12T00:00:00+00:00",
+            },
+            {
+                "id": "b-order-2",
+                "status": "paid",
+                "amount_cents": 800,
+                "currency": "USD",
+                "version": 1,
+                "updated_at": "2026-06-12T00:00:00+00:00",
+            },
+        ]
+        target_rows = [
+            {
+                **source_rows[0],
+                "indexed_at": "2026-06-12T00:00:02Z",
+            },
+            {
+                **source_rows[1],
+                "amount_cents": 700,
+                "indexed_at": "2026-06-12T00:00:02Z",
+            },
+        ]
+        source_buckets = summarize_rows_by_prefix(source_rows, prefix_length=1)
+        target_buckets = summarize_rows_by_prefix(target_rows, prefix_length=1)
+        _source, _target, mismatches = compare_bucket_summaries(source_buckets, target_buckets)
+
+        self.assertEqual([item["bucket"] for item in mismatches], ["b"])
+
+        report = compare_paid_order_checksum_buckets(
+            source_buckets=source_buckets,
+            target_buckets=target_buckets,
+            source_rows=[source_rows[1]],
+            target_rows=[target_rows[1]],
+            prefix_length=1,
+        )
+        payload = report.to_dict()
+
+        self.assertFalse(report.healthy)
+        self.assertEqual(report.guarantee, "checksumMerkle")
+        self.assertEqual(report.drift_count, 2)
+        self.assertEqual(report.stale[0]["order_id"], "b-order-2")
+        self.assertEqual(
+            payload["observation_window"]["checksum_tree"]["mismatched_bucket_count"],
+            1,
+        )
+        self.assertEqual(
+            payload["kubernetes_status"]["observationWindow"]["checksumTree"]["drilldown"]["source_rows"],
+            1,
+        )
 
     def test_freshness_detects_missing_and_stale_derived_updates(self):
         source = [
@@ -807,6 +867,41 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(result["repair_mode"], "clickhouse-backfill")
         self.assertEqual(result["table"], "orders_rollup")
         self.assertEqual(request_payload["ids"], ["order-1"])
+
+    def test_clickhouse_backfill_can_execute_full_scope_when_explicitly_enabled(self):
+        payload = {
+            "aggregate_mismatches": [
+                {
+                    "field": "count",
+                    "source": 10,
+                    "target": 8,
+                }
+            ]
+        }
+        settings = SimpleNamespace(report_dir=Path("/tmp"))
+        fake_analytics = SimpleNamespace(
+            backfill_orders_analytics=Mock(
+                return_value={
+                    "selected": 10,
+                    "inserted": 10,
+                }
+            )
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            settings.report_dir = Path(tmpdir)
+            with patch.dict("sys.modules", {"dataguard.analytics": fake_analytics}):
+                with patch.dict("os.environ", {"CLICKHOUSE_BACKFILL_EXECUTE": "true"}):
+                    result = repair_from_payload(
+                        settings,
+                        payload,
+                        mode="clickhouse-backfill",
+                        verbose=False,
+                    )
+
+        fake_analytics.backfill_orders_analytics.assert_called_once_with(settings, None)
+        self.assertEqual(result["scope"], "full-paid-orders")
+        self.assertEqual(result["executed"]["inserted"], 10)
 
     def test_repair_from_payload_can_publish_kafka_replay_requests(self):
         payload = {"missing": [{"order_id": "order-1"}]}

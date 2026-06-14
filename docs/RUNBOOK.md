@@ -129,7 +129,7 @@ That target performs the full vertical slice:
 ```text
 create or reuse the kind cluster
 build and load the checker and operator images
-apply Postgres, Redpanda, OpenSearch, and Redis demo StatefulSets
+apply Postgres, Redpanda, OpenSearch, Redis, and ClickHouse demo StatefulSets
 seed 50 orders from an in-cluster data worker pod
 consume Kafka events with deliberate OpenSearch drift
 apply CRDs, example resources, and the operator deployment
@@ -158,9 +158,10 @@ dataguard-postgres:5432
 dataguard-redpanda:9092
 dataguard-opensearch:9200
 dataguard-redis:6379
+dataguard-clickhouse:8123
 ```
 
-The example resources include demo Kubernetes Secrets for those Services: `orders-postgres-secret/dsn`, `orders-opensearch-secret/url`, `orders-redis-secret/url`, and `orders-kafka-secret/bootstrapServers`.
+The example resources include demo Kubernetes Secrets for those Services: `orders-postgres-secret/dsn`, `orders-opensearch-secret/url`, `orders-redis-secret/url`, `orders-clickhouse-secret/url,user,password`, and `orders-kafka-secret/bootstrapServers`.
 
 In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`. The operator also watches `DataSource`, `DerivedView`, and referenced Secret objects, so topology changes and credential rotation enqueue the dependent `Invariant`s.
 
@@ -191,6 +192,8 @@ To force a new checker generation after creating drift:
 ```sh
 kubectl patch invariant paid-orders-indexed --type=merge -p '{"spec":{"maxLagSeconds":0}}'
 kubectl patch invariant paid-orders-aggregate --type=merge -p '{"spec":{"maxLagSeconds":0}}'
+kubectl patch invariant paid-orders-checksum --type=merge -p '{"spec":{"maxLagSeconds":0,"checksumPrefixLength":1}}'
+kubectl patch invariant paid-orders-clickhouse-aggregate --type=merge -p '{"spec":{"maxLagSeconds":0}}'
 ```
 
 To restore the example SLO after repair:
@@ -198,6 +201,8 @@ To restore the example SLO after repair:
 ```sh
 kubectl patch invariant paid-orders-indexed --type=merge -p '{"spec":{"maxLagSeconds":60,"severity":"critical"}}'
 kubectl patch invariant paid-orders-aggregate --type=merge -p '{"spec":{"maxLagSeconds":60,"severity":"critical"}}'
+kubectl patch invariant paid-orders-checksum --type=merge -p '{"spec":{"maxLagSeconds":60,"severity":"warning"}}'
+kubectl patch invariant paid-orders-clickhouse-aggregate --type=merge -p '{"spec":{"maxLagSeconds":60,"severity":"warning"}}'
 ```
 
 Runtime-verified result:
@@ -286,6 +291,15 @@ Services:
 - Redpanda Kafka API: `localhost:19092`
 - Redpanda Console: `http://localhost:8080`
 - OpenSearch: `http://localhost:9200`
+- Redis: `localhost:6379`
+
+Optional analytics service:
+
+```sh
+make up-analytics
+```
+
+- ClickHouse HTTP: `http://localhost:8123`
 
 ## Initialize
 
@@ -312,6 +326,7 @@ make seed
 make index
 make check
 make check-aggregate
+make check-checksum
 make check-freshness
 ```
 
@@ -329,6 +344,7 @@ make seed
 make drift
 make check
 make check-aggregate
+make check-checksum
 ```
 
 This generates orders and runs the indexer with:
@@ -366,6 +382,31 @@ To repair and verify freshness directly:
 
 ```sh
 make repair-freshness
+```
+
+## ClickHouse Analytics Drift Demo
+
+Start the analytics profile, seed source data, backfill the analytics table while deliberately skipping some paid orders, then check the aggregate invariant:
+
+```sh
+make up-analytics
+make seed
+make drift-clickhouse
+make check-clickhouse-aggregate
+```
+
+Or run the full compose analytics proof:
+
+```sh
+make demo-clickhouse-drift
+```
+
+Expected result:
+
+```text
+healthy: false
+guarantee: analyticsAggregate
+aggregate_mismatches contains count and/or total_amount_cents
 ```
 
 Expected result after verification:

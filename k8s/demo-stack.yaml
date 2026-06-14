@@ -493,3 +493,123 @@ spec:
         resources:
           requests:
             storage: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataguard-clickhouse
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: clickhouse
+spec:
+  selector:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+    - name: native
+      port: 9000
+      targetPort: native
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataguard-clickhouse-headless
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: clickhouse
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: clickhouse
+  ports:
+    - name: http
+      port: 8123
+      targetPort: http
+    - name: native
+      port: 9000
+      targetPort: native
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dataguard-clickhouse
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: clickhouse
+spec:
+  serviceName: dataguard-clickhouse-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubedataguard
+      app.kubernetes.io/component: clickhouse
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubedataguard
+        app.kubernetes.io/component: clickhouse
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 101
+      containers:
+        - name: clickhouse
+          image: clickhouse/clickhouse-server:24.12
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8123
+            - name: native
+              containerPort: 9000
+          env:
+            - name: CLICKHOUSE_DB
+              value: dataguard
+            - name: CLICKHOUSE_USER
+              value: dataguard
+            - name: CLICKHOUSE_PASSWORD
+              value: dataguard
+            - name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT
+              value: "1"
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: clickhouse-data
+              mountPath: /var/lib/clickhouse
+  volumeClaimTemplates:
+    - metadata:
+        name: clickhouse-data
+        labels:
+          app.kubernetes.io/name: kubedataguard
+          app.kubernetes.io/component: clickhouse
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 1Gi

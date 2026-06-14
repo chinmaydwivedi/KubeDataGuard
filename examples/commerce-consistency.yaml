@@ -25,6 +25,16 @@ stringData:
 apiVersion: v1
 kind: Secret
 metadata:
+  name: orders-clickhouse-secret
+type: Opaque
+stringData:
+  url: http://dataguard-clickhouse:8123
+  user: dataguard
+  password: dataguard
+---
+apiVersion: v1
+kind: Secret
+metadata:
   name: orders-kafka-secret
 type: Opaque
 stringData:
@@ -98,6 +108,25 @@ spec:
 apiVersion: dataguard.io/v1alpha1
 kind: Invariant
 metadata:
+  name: paid-orders-checksum
+  annotations:
+    dataguard.io/checker-mode: job
+    dataguard.io/checker-image: kubedataguard-dataguard:latest
+spec:
+  derivedViewRef: orders-search-index
+  type: checksum
+  checkIntervalSeconds: 300
+  maxLagSeconds: 60
+  checksumPrefixLength: 1
+  severity: warning
+  sourceQuery: |
+    Prefix-bucket checksum over paid orders in Postgres.
+  targetQuery: |
+    Prefix-bucket checksum over paid orders in OpenSearch.
+---
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
   name: paid-orders-freshness
   annotations:
     dataguard.io/checker-mode: job
@@ -167,6 +196,51 @@ spec:
   actions:
     - type: invalidate-cache
       keyTemplate: order:{id}
+---
+apiVersion: dataguard.io/v1alpha1
+kind: DerivedView
+metadata:
+  name: orders-clickhouse-analytics
+spec:
+  sourceRef: orders-postgres
+  target:
+    type: clickhouse
+    connectionSecret: orders-clickhouse-secret
+    database: dataguard
+    table: orders_analytics
+  pipeline:
+    type: backfill
+---
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
+  name: paid-orders-clickhouse-aggregate
+  annotations:
+    dataguard.io/checker-mode: job
+    dataguard.io/checker-image: kubedataguard-dataguard:latest
+spec:
+  derivedViewRef: orders-clickhouse-analytics
+  type: clickhouse-aggregate
+  checkIntervalSeconds: 300
+  maxLagSeconds: 60
+  severity: warning
+  sourceQuery: |
+    select count(*), coalesce(sum(amount_cents), 0)
+    from orders
+    where status = 'paid'
+  targetQuery: |
+    ClickHouse count and sum(amount_cents) from orders_analytics where status = 'paid'
+---
+apiVersion: dataguard.io/v1alpha1
+kind: RepairPolicy
+metadata:
+  name: backfill-paid-orders-clickhouse
+spec:
+  invariantRef: paid-orders-clickhouse-aggregate
+  approvalRequired: true
+  actions:
+    - type: clickhouse-backfill
+      table: orders_analytics
 ---
 apiVersion: dataguard.io/v1alpha1
 kind: Invariant

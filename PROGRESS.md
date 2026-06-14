@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView/Secret watch fan-out to dependent Invariants, production-shaped demo StatefulSets, a first CDC frontier proof across Postgres WAL/outbox, Kafka offsets, and target applied-offset evidence, and a second Postgres -> Redis cache freshness derived-view path.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView/Secret watch fan-out to dependent Invariants, production-shaped demo StatefulSets, a first CDC frontier proof across Postgres WAL/outbox, Kafka offsets, and target applied-offset evidence, a second Postgres -> Redis cache freshness derived-view path, prefix-bucket checksum narrowing, and a Postgres -> ClickHouse analytics aggregate path.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, compact reports, local retention cleanup, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, CDC frontier evidence, Redis cache freshness checks, Prometheus/OTEL-shaped observability artifacts, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology/Secret-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch/Redis demo stack, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, compact reports, local retention cleanup, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, checksum/Merkle-style bucket evidence, CDC frontier evidence, Redis cache freshness checks, ClickHouse analytics aggregate checks, Prometheus/OTEL-shaped observability artifacts, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology/Secret-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch/Redis/ClickHouse demo stack, and deeper docs.
 
 ## Decisions Made
 
@@ -33,6 +33,7 @@ make up       # starts Postgres, Redpanda, Redpanda Console, and OpenSearch
 make seed     # resets the demo and inserts 50 orders, most marked paid
 make drift    # simulates an indexer bug that commits some paid events without indexing them
 make check    # reports missing paid orders with order IDs and source details
+make check-checksum # compares bucket checksums and drills into mismatched buckets
 make repair   # reindexes missing/stale orders from Postgres and verifies the invariant
 make check    # produces a clean report
 ```
@@ -74,6 +75,8 @@ after aggregate: Healthy
 - `src/dataguard/indexer.py`
 - `src/dataguard/checker.py`
 - `src/dataguard/repair.py`
+- `src/dataguard/merkle.py`
+- `src/dataguard/analytics.py`
 - `src/dataguard/local_demo.py`
 - `src/dataguard/k8s_report.py`
 - `src/dataguard/cli.py`
@@ -597,7 +600,7 @@ What remains intentionally open:
 ```text
 source scan checkpoints now persist the last processed key, but not a full source snapshot proof
 generic query source scan watermarks are not yet tied to Kafka/CDC offsets
-parallel chunk scans and Merkle/checksum comparison are not implemented yet
+parallel chunk scans are still open; prefix-bucket checksum narrowing was added in a later pass
 ```
 
 Runtime-verified:
@@ -661,7 +664,7 @@ What remains intentionally open:
 ```text
 Resumed suffix scans are marked partial; they are not represented as complete snapshots.
 The commerce path has a first WAL/outbox/Kafka/target-applied-offset frontier, but generic resumed scans are not yet bound to that frontier.
-There is no parallel chunk scheduler or Merkle/checksum narrowing yet.
+There is no parallel chunk scheduler yet; prefix-bucket checksum narrowing was added later for the commerce path.
 ```
 
 Verification for this checkpoint pass:
@@ -1038,10 +1041,10 @@ Every paid order in Postgres must exist in OpenSearch within 60 seconds.
 ## Verification Not Completed
 
 - A Kubernetes-native Postgres/Redpanda/OpenSearch demo stack has been added; production-grade stateful storage and Helm/operator installs are intentionally out of scope for the demo.
-- Source-of-truth reindex repair is implemented for existence and freshness drift. Broader repair strategies such as Kafka replay, cache invalidation, and aggregate backfill are not implemented yet.
-- Secret-backed worker env wiring and DataSource/DerivedView watch fan-out are implemented; immediate Secret rotation fan-out is not implemented yet.
+- Source-of-truth reindex repair is implemented for explicit demos. Safer repair request modes now cover Kafka replay, webhooks, Redis invalidation, and ClickHouse backfill requests.
+- Secret-backed worker env wiring, DataSource/DerivedView watch fan-out, and Secret rotation fan-out are implemented.
 - The generic query runner is intentionally limited to Postgres source queries and OpenSearch JSON target queries.
-- S3/MinIO-compatible report persistence is implemented; retention, encryption, lifecycle policy, and compaction are still open.
+- S3/MinIO-compatible report persistence, compact reports, retention cleanup, and SSE/KMS upload knobs are implemented; managed cloud lifecycle policies are still external.
 
 ## Intermediate Roadmap Before Mature Operator
 
@@ -1184,7 +1187,7 @@ Still not full DBLog:
 - no Postgres logical decoding slot
 - no exact snapshot-plus-log handoff protocol
 - no crash-exact resume after checker failure
-- no Merkle/checksum narrowing for huge histories
+- prefix-bucket checksum narrowing exists for the commerce path; parallel chunk scheduling is still open
 - no proof that max target offset implies gap-free application for arbitrary derived views
 
 ### CDC Evidence
@@ -1292,6 +1295,49 @@ Expected behavior:
 
 ## Next Actions
 
+## Latest Advanced Correctness Pass
+
+Implemented now:
+
+- Added `checksum` invariant support for Postgres -> OpenSearch.
+- Added prefix-bucket checksum/Merkle-style narrowing:
+  - source and target are compared by deterministic ID-prefix buckets first
+  - each bucket fingerprint includes count, paid amount sum, and version sum
+  - exact row fetch happens only for mismatched buckets
+  - reports include `observation_window.checksum_tree`
+- Added `dataguard check --invariant checksum`.
+- Added `make check-checksum`.
+- Added CRD field `spec.checksumPrefixLength`.
+- Added operator Job arg projection for checksum checks.
+- Added `src/dataguard/merkle.py` for pure checksum bucket logic.
+- Added `src/dataguard/analytics.py` using ClickHouse HTTP API without a new driver dependency.
+- Added ClickHouse analytics commands:
+  - `dataguard analytics-init`
+  - `dataguard analytics-backfill`
+  - `dataguard check --invariant clickhouse-aggregate`
+- Added `make up-analytics`, `make demo-clickhouse-drift`, and `make check-clickhouse-aggregate`.
+- Added ClickHouse StatefulSet, Services, PVC, probes, and resource bounds to the kind demo stack.
+- Added ClickHouse Secret/DerivedView/Invariant/RepairPolicy examples.
+- Extended operator env resolution for ClickHouse target Secrets.
+- Kept ClickHouse repair safe by default:
+  - normal `clickhouse-backfill` emits a backfill request artifact
+  - execution requires explicit `CLICKHOUSE_BACKFILL_EXECUTE=true`
+
+Runtime-verified now:
+
+- Rebuilt the Docker worker image with the new checksum and ClickHouse code.
+- Ran `make seed && make drift && make check-checksum`.
+  - OpenSearch indexer processed 50 events, indexed 42, skipped 8.
+  - `paid-orders-checksum` reported `DriftDetected`.
+  - Checksum tree found 6 mismatched ID-prefix buckets.
+  - Drilldown fetched only 15 source rows and 7 target rows from mismatched buckets.
+  - The report identified the 8 skipped paid orders as missing counterexamples.
+- Ran `make demo-clickhouse-drift`.
+  - ClickHouse analytics profile started successfully.
+  - Analytics backfill selected 41 paid orders, inserted 33, skipped 8.
+  - `paid-orders-clickhouse-aggregate` reported `DriftDetected`.
+  - Aggregate mismatches showed source count 41 vs target count 33 and revenue mismatch.
+
 ## Latest Roadmap Completion Pass
 
 Implemented now:
@@ -1328,16 +1374,16 @@ Implemented now:
 
 ## Next Actions
 
-1. Runtime-verify the new StatefulSet/Redis stack end to end in kind.
+1. Runtime-verify the new StatefulSet/Redis/ClickHouse stack end to end in kind.
 2. Expand failure taxonomy coverage:
    - target unavailable
    - checker timeout
    - repair Job crash before report publication
    - repair retry/idempotency
    - stale/corrupt target document
-3. Add checksum/Merkle narrowing for huge datasets.
-4. Add a real ClickHouse analytics table demo.
-5. Add managed lifecycle policy examples for S3/GCS outside the worker.
+3. Runtime-verify `make demo-clickhouse-drift` with the analytics compose profile.
+4. Add managed lifecycle policy examples for S3/GCS outside the worker.
+5. Add OpenLineage event emission for check and repair reports.
 
 ## Open Questions
 
@@ -1368,7 +1414,7 @@ Current answer:
 - Persisted scan checkpoints are implemented for bounded keyset scans.
 - Secret-backed `DataSource` and `DerivedView` resolution is implemented for the job-backed operator.
 - `DataSource` and `DerivedView` topology changes now enqueue affected `Invariant`s.
-- Next: runtime verification of the new Redis/StatefulSet stack, checksum/Merkle narrowing, and ClickHouse analytics backfill.
+- Next: runtime verification of the full Redis/ClickHouse StatefulSet stack, lifecycle policy examples, and OpenLineage emission.
 
 ### Future
 

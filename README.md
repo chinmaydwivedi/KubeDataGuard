@@ -12,15 +12,17 @@ What is implemented and verified:
 
 - Postgres -> Redpanda/Kafka -> OpenSearch demo pipeline.
 - Second derived-view path: Postgres -> Redpanda/Kafka -> Redis cache freshness.
+- Analytics derived-view path: Postgres -> ClickHouse paid-order aggregate checks.
 - Hardcoded commerce invariants for existence, aggregate consistency, and bounded freshness.
+- Prefix-bucket checksum/Merkle-style narrowing for large Postgres -> OpenSearch comparisons.
 - A first generic query invariant for Postgres source queries and OpenSearch JSON target queries.
 - Keyset-paginated Postgres source scans for query invariants, with source scan evidence in reports.
 - Persisted source-scan checkpoints for bounded query scans, stored in the same local or S3-compatible report store.
 - OpenSearch target query pagination with `search_after`; `size` is treated as page size, not a correctness cap.
 - First CDC frontier proof for the commerce path: Postgres WAL LSN, outbox publication state, Kafka partition offsets, and OpenSearch applied-offset evidence are recorded in the observation window.
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
-- A Kubernetes-native kind demo stack for Postgres, Redpanda, OpenSearch, Redis, checker Jobs, and the operator.
-- Production-shaped demo StatefulSets with PVCs, probes, and resource bounds for Postgres, Redpanda, OpenSearch, and Redis.
+- A Kubernetes-native kind demo stack for Postgres, Redpanda, OpenSearch, Redis, ClickHouse, checker Jobs, and the operator.
+- Production-shaped demo StatefulSets with PVCs, probes, and resource bounds for Postgres, Redpanda, OpenSearch, Redis, and ClickHouse.
 - Compact Kubernetes status handoff through ConfigMaps.
 - Full JSON/Markdown reports written to the worker report store and referenced from status.
 - Optional S3/MinIO-compatible durable report publication with `s3://...` status refs.
@@ -34,7 +36,7 @@ What is implemented and verified:
 
 What is intentionally not solved yet:
 
-- Arbitrary databases and target stores beyond the current Postgres/OpenSearch and Redis-cache paths.
+- Arbitrary databases and target stores beyond the current Postgres/OpenSearch, Redis-cache, and ClickHouse analytics paths.
 - Full DBLog-style logical decoding, exact snapshot-plus-log recovery, and crash-exact scan recovery.
 - Managed object-store lifecycle policies outside KubeDataGuard's own upload metadata.
 - Fully managed production operators for databases; the checked-in stack is production-shaped, not a replacement for CloudNativePG, Redpanda Operator, or OpenSearch Operator.
@@ -122,10 +124,12 @@ make seed     # resets the demo and inserts 50 orders, most marked paid
 make drift    # commits some paid events without indexing them
 make drift-cache # commits some paid events without updating Redis
 make check    # reports missing paid orders with order IDs and source details
+make check-checksum # compares source/target bucket fingerprints, then drills into bad buckets
 make check-redis-freshness # checks the Postgres -> Redis cache freshness invariant
 make repair   # reindexes missing/stale orders from Postgres and verifies
 make check    # produces a clean report
 make demo-freshness-drift # proves bounded-freshness drift with source/target timestamps
+make up-analytics && make demo-clickhouse-drift # proves analytics aggregate drift in ClickHouse
 make k8s-demo # runs the Kubernetes-native kind stack and operator proof
 ```
 
@@ -796,6 +800,7 @@ Expected behavior:
 
 - Implemented aggregate checks: paid order count and revenue total
 - Implemented bounded freshness checks using source `updated_at`, target `indexed_at`, Postgres LSN, Kafka offset evidence, and target applied-offset evidence
+- Implemented prefix-bucket checksum narrowing for large source/target comparisons
 - Implemented freshness drift injection and freshness repair verification
 - Implemented first generic Postgres/OpenSearch query invariant path
 - Implemented Postgres -> Redis cache freshness as the second source/derived pair
@@ -816,7 +821,8 @@ Expected behavior:
 
 - Implemented Postgres -> Redis cache freshness
 - Added Redis cache indexer, Redis derived view CRD example, Redis Secret env resolution, Redis frontier evidence, and cache invalidation repair requests
-- Next: ClickHouse aggregate backfill as the first analytics derived-view path
+- Implemented Postgres -> ClickHouse analytics aggregate checks
+- Added ClickHouse analytics table initialization, backfill, drift demo, derived view CRD example, Secret env resolution, and backfill request repair mode
 
 ### Milestone 6: Operator Shape
 
@@ -829,7 +835,7 @@ Expected behavior:
 - Implemented repair Job creation from explicitly allowed `RepairPolicy`
 - Implemented repair result ConfigMap handoff and verified status update
 - Added operator Dockerfile and in-cluster Deployment/RBAC sketch
-- Added Kubernetes-native demo stack for Postgres, Redpanda, OpenSearch, and Redis
+- Added Kubernetes-native demo stack for Postgres, Redpanda, OpenSearch, Redis, and ClickHouse
 - Converted demo data systems to StatefulSets with PVCs, probes, and resource requests/limits
 - Added Secret rotation fan-out to dependent Invariants
 - Enabled CRD `status` subresource
@@ -851,6 +857,7 @@ Expected behavior:
 
 ### Milestone 8: Advanced Checks
 
+- Implemented prefix-bucket checksum/Merkle-style narrowing
 - Schema compatibility checks
 - Sampled checks for large tables
 - Shard-aware checks

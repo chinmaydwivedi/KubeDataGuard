@@ -50,6 +50,16 @@ def main() -> None:
         help="simulate a bug by committing every Nth paid event without caching it",
     )
 
+    analytics_init_parser = subcommands.add_parser("analytics-init", help="initialize ClickHouse analytics table")
+    analytics_init_parser.add_argument("--reset", action="store_true", help="truncate the analytics table")
+
+    analytics_backfill_parser = subcommands.add_parser("analytics-backfill", help="backfill paid orders into ClickHouse analytics")
+    analytics_backfill_parser.add_argument(
+        "--skip-every-paid",
+        type=int,
+        help="simulate an analytics backfill bug by skipping every Nth paid order",
+    )
+
     freshness_drift_parser = subcommands.add_parser(
         "inject-freshness-drift",
         help="simulate a stale derived view that violates bounded freshness",
@@ -62,11 +72,12 @@ def main() -> None:
     check_parser.add_argument("--max-lag-seconds", type=int, default=60)
     check_parser.add_argument(
         "--invariant",
-        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
+        choices=["existence", "aggregate", "checksum", "freshness", "redis-freshness", "clickhouse-aggregate", "query"],
         default="existence",
         help="which invariant to check",
     )
     add_query_args(check_parser)
+    add_checksum_args(check_parser)
     check_parser.add_argument("--write-report", action="store_true")
 
     check_job_parser = subcommands.add_parser(
@@ -76,11 +87,12 @@ def main() -> None:
     check_job_parser.add_argument("--max-lag-seconds", type=int, default=60)
     check_job_parser.add_argument(
         "--invariant",
-        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
+        choices=["existence", "aggregate", "checksum", "freshness", "redis-freshness", "clickhouse-aggregate", "query"],
         default="existence",
         help="which invariant to check",
     )
     add_query_args(check_job_parser)
+    add_checksum_args(check_job_parser)
     check_job_parser.add_argument("--namespace")
     check_job_parser.add_argument("--config-map", required=True)
     check_job_parser.add_argument("--invariant-name", required=True)
@@ -98,10 +110,11 @@ def main() -> None:
     repair_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_parser.add_argument(
         "--verify-invariant",
-        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
+        choices=["existence", "aggregate", "checksum", "freshness", "redis-freshness", "clickhouse-aggregate", "query"],
         default="existence",
     )
     add_query_args(repair_parser)
+    add_checksum_args(repair_parser)
 
     repair_job_parser = subcommands.add_parser(
         "repair-job",
@@ -121,10 +134,11 @@ def main() -> None:
     repair_job_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_job_parser.add_argument(
         "--verify-invariant",
-        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
+        choices=["existence", "aggregate", "checksum", "freshness", "redis-freshness", "clickhouse-aggregate", "query"],
         default="existence",
     )
     add_query_args(repair_job_parser)
+    add_checksum_args(repair_job_parser)
 
     local_demo_parser = subcommands.add_parser(
         "demo-local",
@@ -144,6 +158,10 @@ def main() -> None:
         run_index(settings, args)
     elif args.command == "cache-index":
         run_cache_index(settings, args)
+    elif args.command == "analytics-init":
+        run_analytics_init(settings, args)
+    elif args.command == "analytics-backfill":
+        run_analytics_backfill(settings, args)
     elif args.command == "inject-freshness-drift":
         run_inject_freshness_drift(settings, args)
     elif args.command == "check":
@@ -225,6 +243,29 @@ def run_cache_index(settings: Settings, args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def run_analytics_init(settings: Settings, args: argparse.Namespace) -> None:
+    from . import analytics
+
+    print("waiting for ClickHouse")
+    analytics.wait_for_clickhouse(settings)
+    print("initializing ClickHouse analytics schema")
+    analytics.init_schema(settings)
+    if args.reset:
+        print("resetting ClickHouse analytics table")
+        analytics.reset_table(settings)
+    print("analytics init complete")
+
+
+def run_analytics_backfill(settings: Settings, args: argparse.Namespace) -> None:
+    from . import analytics
+
+    result = analytics.backfill_orders_analytics(
+        settings,
+        skip_every_paid=args.skip_every_paid,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def run_inject_freshness_drift(settings: Settings, args: argparse.Namespace) -> None:
     from . import db, search
     from .invariants import iso
@@ -287,6 +328,7 @@ def run_check(settings: Settings, args: argparse.Namespace):
         source_checkpoint_id=getattr(args, "source_checkpoint_id", ""),
         source_reset_checkpoint=getattr(args, "source_reset_checkpoint", False),
         source_max_pages=getattr(args, "source_max_pages", 0),
+        checksum_prefix_length=getattr(args, "checksum_prefix_length", 1),
         check_id=getattr(args, "check_id", ""),
     )
 
@@ -322,6 +364,7 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
         source_checkpoint_id=args.source_checkpoint_id,
         source_reset_checkpoint=args.source_reset_checkpoint,
         source_max_pages=args.source_max_pages,
+        checksum_prefix_length=args.checksum_prefix_length,
         check_id=args.check_id,
     )
 
@@ -370,6 +413,7 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
             source_checkpoint_id=args.source_checkpoint_id,
             source_reset_checkpoint=args.source_reset_checkpoint,
             source_max_pages=args.source_max_pages,
+            checksum_prefix_length=args.checksum_prefix_length,
         )
         print("post-repair verification:")
         payload = report.to_dict()
@@ -406,6 +450,7 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
         source_checkpoint_id=args.source_checkpoint_id,
         source_reset_checkpoint=args.source_reset_checkpoint,
         source_max_pages=args.source_max_pages,
+        checksum_prefix_length=args.checksum_prefix_length,
         check_id=args.check_id,
     )
 
@@ -445,6 +490,10 @@ def add_query_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--source-max-pages", type=int, default=0)
 
 
+def add_checksum_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--checksum-prefix-length", type=int, default=1)
+
+
 def parse_compare_fields(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
@@ -465,6 +514,7 @@ def check_invariant(
     source_checkpoint_id: str = "",
     source_reset_checkpoint: bool = False,
     source_max_pages: int = 0,
+    checksum_prefix_length: int = 1,
     check_id: str = "",
 ):
     if invariant == "existence":
@@ -477,6 +527,12 @@ def check_invariant(
             settings,
             max_lag_seconds=max_lag_seconds,
         )
+    if invariant == "checksum":
+        return checker.check_paid_orders_checksum(
+            settings,
+            max_lag_seconds=max_lag_seconds,
+            prefix_length=checksum_prefix_length,
+        )
     if invariant == "freshness":
         return checker.check_paid_orders_freshness(
             settings,
@@ -484,6 +540,11 @@ def check_invariant(
         )
     if invariant == "redis-freshness":
         return checker.check_paid_orders_redis_freshness(
+            settings,
+            max_lag_seconds=max_lag_seconds,
+        )
+    if invariant == "clickhouse-aggregate":
+        return checker.check_paid_orders_clickhouse_aggregate(
             settings,
             max_lag_seconds=max_lag_seconds,
         )

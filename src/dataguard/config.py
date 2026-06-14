@@ -14,6 +14,11 @@ class Settings:
     orders_index: str
     redis_url: str
     order_cache_prefix: str
+    clickhouse_url: str
+    clickhouse_user: str
+    clickhouse_password: str
+    clickhouse_database: str
+    clickhouse_table: str
     report_dir: Path
     report_store: str
     report_bucket: str
@@ -41,6 +46,11 @@ class Settings:
             orders_index=os.getenv("ORDERS_INDEX", "orders"),
             redis_url=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
             order_cache_prefix=os.getenv("ORDER_CACHE_PREFIX", "order"),
+            clickhouse_url=os.getenv("CLICKHOUSE_URL", "http://localhost:8123"),
+            clickhouse_user=os.getenv("CLICKHOUSE_USER", "dataguard"),
+            clickhouse_password=os.getenv("CLICKHOUSE_PASSWORD", "dataguard"),
+            clickhouse_database=os.getenv("CLICKHOUSE_DATABASE", "dataguard"),
+            clickhouse_table=os.getenv("CLICKHOUSE_TABLE", "orders_analytics"),
             report_dir=Path(os.getenv("REPORT_DIR", "reports")),
             report_store=os.getenv("REPORT_STORE", "local"),
             report_bucket=os.getenv("REPORT_BUCKET", ""),

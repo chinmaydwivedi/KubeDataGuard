@@ -40,7 +40,15 @@ spec:
                     connectionSecretKey:
                       type: string
                       default: url
+                    userKey:
+                      type: string
+                      default: user
+                    passwordKey:
+                      type: string
+                      default: password
                     index:
+                      type: string
+                    database:
                       type: string
                     table:
                       type: string

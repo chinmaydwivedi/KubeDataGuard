@@ -2,18 +2,19 @@
 
 ## System Boundary
 
-The MVP protects one derived view:
+The MVP protects three derived-view shapes:
 
 ```text
 Postgres orders table -> Redpanda orders.events topic -> OpenSearch orders index
 Postgres orders table -> Redpanda orders.events topic -> Redis order cache
+Postgres orders table -> ClickHouse orders_analytics table
 ```
 
 There are now three execution modes:
 
 - `demo-local`: deterministic no-Docker proof that models Postgres source rows and OpenSearch documents in memory.
-- Compose demo: real Postgres, Redpanda, OpenSearch, and Redis integration.
-- Kubernetes job-backed demo: kind runs Postgres, Redpanda, OpenSearch, Redis, the Go operator, and scheduled Python checker/repair Jobs in-cluster.
+- Compose demo: real Postgres, Redpanda, OpenSearch, Redis, and optional ClickHouse integration.
+- Kubernetes job-backed demo: kind runs Postgres, Redpanda, OpenSearch, Redis, ClickHouse, the Go operator, and scheduled Python checker/repair Jobs in-cluster.
 
 All three modes use the same invariant/report semantics. The local proof is not the final runtime target; it is a fast, dependency-light way to prove the control loop.
 
@@ -22,6 +23,7 @@ The declared consistency SLOs:
 ```text
 Every paid order committed in Postgres must appear in the OpenSearch orders index after the allowed lag window.
 Every paid order committed in Postgres must be reflected in the Redis cache after the allowed lag window.
+The ClickHouse analytics table must match paid-order count and revenue aggregates after a backfill.
 ```
 
 ## Why This Is The Right First Slice
@@ -32,6 +34,7 @@ This slice contains the core DDIA problem without drowning in infrastructure:
 - Redpanda/Kafka is the replication log.
 - OpenSearch is derived data for search.
 - Redis is derived data for low-latency cache reads.
+- ClickHouse is derived data for analytics aggregates.
 - The indexer is the asynchronous pipeline.
 - The checker measures whether the derived view is trustworthy.
 - The repair command rebuilds missing or stale records from the source of truth.
@@ -88,6 +91,7 @@ The first invariant layers are intentionally complementary:
 - Existence and field equality catch missing or stale individual records.
 - Aggregate consistency catches count and revenue mismatches that might be visible in analytics or dashboards.
 - Bounded freshness catches source updates that OpenSearch or Redis has not observed within the declared lag window.
+- Prefix-bucket checksum narrowing catches large source/target mismatches without fetching every row first.
 
 This mirrors real systems: user-facing search may need record-level correctness, business dashboards often need aggregate correctness, and replicated read paths need freshness evidence.
 
@@ -130,6 +134,7 @@ check command
   |-- query paid orders from Postgres
   |-- mget same ids from OpenSearch
   |-- classify missing/stale/aggregate/freshness drift
+  |-- optionally compare checksum buckets before fetching exact row counterexamples
   |-- preserve source LSN, outbox, stream offset, and target applied-offset evidence
   |-- write JSON/Markdown reports locally and optionally to S3/MinIO
   |
@@ -211,16 +216,21 @@ The implemented invariants are intentionally layered:
 ```text
 paid-orders-indexed
 paid-orders-aggregate
+paid-orders-checksum
 paid-orders-freshness
+paid-orders-redis-cache-freshness
+paid-orders-clickhouse-aggregate
 ```
 
 They check:
 
 - existence: paid source order exists in target index
 - field equality: status, amount, currency, and version match
+- checksum: source and target bucket fingerprints match before drilling into mismatched ID prefixes
 - aggregate equality: paid order count and revenue total match
 - bounded freshness: source `updated_at` has been observed by target `indexed_at`
 - freshness eligibility: only checks source records older than `max_lag_seconds`
+- analytics aggregate: ClickHouse paid-order count and revenue match the Postgres source
 
 For bounded freshness, `indexed_at < updated_at` is current drift because the derived document predates the source update. `indexed_at - updated_at > max_lag_seconds` is recorded as an SLO breach because it proves the update arrived late, but the derived view is currently caught up.
 
@@ -292,8 +302,8 @@ The local commands map directly to operator reconciliation:
 
 ```text
 DataSource    -> Postgres connection
-DerivedView   -> OpenSearch index or Redis cache derived through Redpanda
-Invariant     -> paid-orders-indexed, paid-orders-freshness, paid-orders-redis-cache-freshness
+DerivedView   -> OpenSearch index, Redis cache, or ClickHouse analytics table
+Invariant     -> paid-orders-indexed, paid-orders-freshness, paid-orders-redis-cache-freshness, paid-orders-clickhouse-aggregate
 RepairPolicy  -> emit reconciliation, Kafka replay, webhook, cache invalidation, ClickHouse backfill, or explicitly approved direct repair
 ```
 
