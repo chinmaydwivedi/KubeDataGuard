@@ -17,6 +17,7 @@ What is implemented and verified:
 - Persisted source-scan checkpoints for bounded query scans, stored in the same local or S3-compatible report store.
 - OpenSearch target query pagination with `search_after`; `size` is treated as page size, not a correctness cap.
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
+- A Kubernetes-native kind demo stack for Postgres, Redpanda, OpenSearch, checker Jobs, and the operator.
 - Compact Kubernetes status handoff through ConfigMaps.
 - Full JSON/Markdown reports written to the worker report store and referenced from status.
 - Optional S3/MinIO-compatible durable report publication with `s3://...` status refs.
@@ -118,6 +119,7 @@ make check    # reports missing paid orders with order IDs and source details
 make repair   # reindexes missing/stale orders from Postgres and verifies
 make check    # produces a clean report
 make demo-freshness-drift # proves bounded-freshness drift with source/target timestamps
+make k8s-demo # runs the Kubernetes-native kind stack and operator proof
 ```
 
 That is the project in miniature: a derived view becomes untrustworthy, KubeDataGuard proves exactly how, then repairs and verifies it.
@@ -452,7 +454,7 @@ Invariant CRD
   |-- Go operator requeues scheduled invariants for the next check interval
 ```
 
-This path has been runtime-verified on kind while the data systems run through Docker Compose.
+This path now has a Kubernetes-native demo stack under `k8s/demo-stack.yaml`, so kind can run Postgres, Redpanda, OpenSearch, checker Jobs, and the operator without reaching through `host.docker.internal`.
 
 ## Invariant Evidence Model
 
@@ -591,7 +593,7 @@ make demo-repair
 Verified Kubernetes checker behavior on this machine:
 
 ```text
-kind + local Go operator + checker Jobs + Compose data systems
+kind + operator + checker Jobs + data systems
 
 generation 2 after deliberate drift:
   paid-orders-indexed: DriftDetected, drift_count=8
@@ -817,6 +819,7 @@ Expected behavior:
 - Implemented repair Job creation from explicitly allowed `RepairPolicy`
 - Implemented repair result ConfigMap handoff and verified status update
 - Added operator Dockerfile and in-cluster Deployment/RBAC sketch
+- Added Kubernetes-native demo stack for Postgres, Redpanda, and OpenSearch
 - Enabled CRD `status` subresource
 - Update `.status` on `Invariant`
 - Run on kind/minikube

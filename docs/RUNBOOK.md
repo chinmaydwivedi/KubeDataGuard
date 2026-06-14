@@ -118,41 +118,50 @@ kubectl annotate invariant paid-orders-indexed dataguard.io/synthetic-drift-coun
 
 ## Job-Backed Operator Proof
 
-Start the Compose data systems first:
+The preferred Kubernetes proof now runs the data systems inside kind:
 
 ```sh
-make up
+make k8s-demo
 ```
 
-Build the checker image and load it into kind:
-
-```sh
-docker compose build dataguard
-kind load docker-image kubedataguard-dataguard:latest --name kubedataguard
-```
-
-Apply CRDs and the example resources:
-
-```sh
-kubectl apply -f k8s/crds
-kubectl apply -f examples/commerce-consistency.yaml
-```
-
-The example resources include demo Kubernetes Secrets:
+That target performs the full vertical slice:
 
 ```text
-orders-postgres-secret: dsn
-orders-opensearch-secret: url
-orders-kafka-secret: bootstrapServers
+create or reuse the kind cluster
+build and load the checker and operator images
+apply Postgres, Redpanda, and OpenSearch demo deployments
+seed 50 orders from an in-cluster data worker pod
+consume Kafka events with deliberate OpenSearch drift
+apply CRDs, example resources, and the operator deployment
+force an immediate drift check by setting demo maxLagSeconds to 0
+show Invariant status and checker Jobs
 ```
 
-In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`. The operator also watches `DataSource` and `DerivedView` objects, so topology changes enqueue the dependent `Invariant`s; Secret rotation is picked up by the next scheduled check or another reconcile.
-
-Run the operator locally against kind:
+The same workflow can be run one step at a time:
 
 ```sh
-go run ./cmd/dataguard-operator --metrics-bind-address=0 --health-probe-bind-address=:8083
+make kind-create
+make k8s-demo-images
+make k8s-demo-stack
+make k8s-demo-seed
+make k8s-demo-drift
+make k8s-demo-resources
+make k8s-demo-force-drift-check
+make k8s-demo-wait-checks
+make k8s-demo-status
 ```
+
+The native demo stack exposes these in-cluster Services:
+
+```text
+dataguard-postgres:5432
+dataguard-redpanda:9092
+dataguard-opensearch:9200
+```
+
+The example resources include demo Kubernetes Secrets for those Services: `orders-postgres-secret/dsn`, `orders-opensearch-secret/url`, and `orders-kafka-secret/bootstrapServers`.
+
+In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`. The operator also watches `DataSource` and `DerivedView` objects, so topology changes enqueue the dependent `Invariant`s; Secret rotation is picked up by the next scheduled check or another reconcile.
 
 The example invariants already opt into job-backed mode:
 

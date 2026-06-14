@@ -1,8 +1,14 @@
 COMPOSE ?= docker compose
 PYTHON ?= python3
+KIND ?= kind
+KUBECTL ?= kubectl
+KIND_CLUSTER ?= kubedataguard
+DEMO_IMAGE ?= kubedataguard-dataguard:latest
+OPERATOR_IMAGE ?= kubedataguard-operator:latest
 APP = $(COMPOSE) run --rm dataguard
+K8S_DEMO_ENV = --env=POSTGRES_DSN=postgresql://dataguard:dataguard@dataguard-postgres:5432/dataguard --env=KAFKA_BOOTSTRAP_SERVERS=dataguard-redpanda:9092 --env=ORDER_EVENTS_TOPIC=orders.events --env=OPENSEARCH_URL=http://dataguard-opensearch:9200 --env=ORDERS_INDEX=orders --env=REPORT_DIR=/tmp/dataguard-reports
 
-.PHONY: up up-object-store down reset init seed generate index drift drift-freshness check check-aggregate check-freshness check-s3 repair repair-freshness demo-local demo-drift demo-freshness-drift demo-repair test operator-test operator-build operator-image
+.PHONY: up up-object-store down reset init seed generate index drift drift-freshness check check-aggregate check-freshness check-s3 repair repair-freshness demo-local demo-drift demo-freshness-drift demo-repair test operator-test operator-build operator-image kind-create k8s-demo-images k8s-demo-stack k8s-demo-resources k8s-demo-seed k8s-demo-drift k8s-demo-force-drift-check k8s-demo-reset-slo k8s-demo-wait-checks k8s-demo-status k8s-demo
 
 up:
 	$(COMPOSE) up -d postgres redpanda-0 redpanda-console opensearch
@@ -82,4 +88,56 @@ operator-build:
 	go build ./cmd/dataguard-operator
 
 operator-image:
-	docker build -f Dockerfile.operator -t kubedataguard-operator:latest .
+	docker build -f Dockerfile.operator -t $(OPERATOR_IMAGE) .
+
+kind-create:
+	$(KIND) get clusters | grep -qx $(KIND_CLUSTER) || $(KIND) create cluster --name $(KIND_CLUSTER) --wait 180s
+
+k8s-demo-images:
+	docker build -t $(DEMO_IMAGE) .
+	docker build -f Dockerfile.operator -t $(OPERATOR_IMAGE) .
+	$(KIND) load docker-image $(DEMO_IMAGE) --name $(KIND_CLUSTER)
+	$(KIND) load docker-image $(OPERATOR_IMAGE) --name $(KIND_CLUSTER)
+
+k8s-demo-stack:
+	$(KUBECTL) apply -f k8s/demo-stack.yaml
+	$(KUBECTL) rollout status deployment/dataguard-postgres --timeout=180s
+	$(KUBECTL) rollout status deployment/dataguard-redpanda --timeout=180s
+	$(KUBECTL) rollout status deployment/dataguard-opensearch --timeout=300s
+
+k8s-demo-resources:
+	$(KUBECTL) apply -f k8s/crds
+	$(KUBECTL) apply -f examples/commerce-consistency.yaml
+	$(KUBECTL) apply -f k8s/operator.yaml
+	$(KUBECTL) rollout status deployment/kubedataguard-operator --timeout=180s
+
+k8s-demo-seed:
+	$(KUBECTL) delete pod dataguard-demo-seed --ignore-not-found
+	$(KUBECTL) run dataguard-demo-seed --image=$(DEMO_IMAGE) --image-pull-policy=IfNotPresent --restart=Never $(K8S_DEMO_ENV) --command -- /bin/sh -c 'python -m dataguard.cli init --reset && python -m dataguard.cli generate --count 50 --paid-ratio 0.8'
+	$(KUBECTL) wait --for=jsonpath='{.status.phase}'=Succeeded pod/dataguard-demo-seed --timeout=300s
+	$(KUBECTL) logs pod/dataguard-demo-seed
+
+k8s-demo-drift:
+	$(KUBECTL) delete pod dataguard-demo-drift --ignore-not-found
+	$(KUBECTL) run dataguard-demo-drift --image=$(DEMO_IMAGE) --image-pull-policy=IfNotPresent --restart=Never $(K8S_DEMO_ENV) --command -- /bin/sh -c 'python -m dataguard.cli index --max-messages 50 --skip-every-paid 5'
+	$(KUBECTL) wait --for=jsonpath='{.status.phase}'=Succeeded pod/dataguard-demo-drift --timeout=300s
+	$(KUBECTL) logs pod/dataguard-demo-drift
+
+k8s-demo-force-drift-check:
+	$(KUBECTL) patch invariant paid-orders-indexed --type=merge -p '{"spec":{"maxLagSeconds":0}}'
+	$(KUBECTL) patch invariant paid-orders-aggregate --type=merge -p '{"spec":{"maxLagSeconds":0}}'
+	$(KUBECTL) wait --for=jsonpath='{.status.phase}'=DriftDetected invariant/paid-orders-indexed --timeout=300s
+	$(KUBECTL) wait --for=jsonpath='{.status.phase}'=DriftDetected invariant/paid-orders-aggregate --timeout=300s
+
+k8s-demo-reset-slo:
+	$(KUBECTL) patch invariant paid-orders-indexed --type=merge -p '{"spec":{"maxLagSeconds":60}}'
+	$(KUBECTL) patch invariant paid-orders-aggregate --type=merge -p '{"spec":{"maxLagSeconds":60}}'
+
+k8s-demo-wait-checks:
+	$(KUBECTL) wait --for=condition=complete job -l app.kubernetes.io/name=kubedataguard --timeout=300s
+
+k8s-demo-status:
+	$(KUBECTL) get invariant -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,DRIFT:.status.driftCount,CHECK:.status.checkID,REPORT:.status.reportRef
+	$(KUBECTL) get jobs -l app.kubernetes.io/name=kubedataguard
+
+k8s-demo: kind-create k8s-demo-images k8s-demo-stack k8s-demo-seed k8s-demo-drift k8s-demo-resources k8s-demo-force-drift-check k8s-demo-wait-checks k8s-demo-status

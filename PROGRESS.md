@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, and DataSource/DerivedView watch fan-out to dependent Invariants.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView watch fan-out to dependent Invariants, and a Kubernetes-native demo stack manifest.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology-change fan-out, example resources, a kind cluster verification path, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch demo stack, and deeper docs.
 
 ## Decisions Made
 
@@ -828,6 +828,82 @@ go build -o /tmp/dataguard-operator ./cmd/dataguard-operator
   Passed
 ```
 
+## Latest Kubernetes-Native Demo Stack Pass
+
+Implemented the next phase after topology watch fan-out: remove the remaining `host.docker.internal` dependency from the intended kind demo.
+
+What changed:
+
+- Added `k8s/demo-stack.yaml` with in-cluster demo deployments and Services for:
+  - `dataguard-postgres`
+  - `dataguard-redpanda`
+  - `dataguard-opensearch`
+- Updated `examples/commerce-consistency.yaml` Secrets to use in-cluster service DNS:
+  - `postgresql://dataguard:dataguard@dataguard-postgres:5432/dataguard`
+  - `http://dataguard-opensearch:9200`
+  - `dataguard-redpanda:9092`
+- Added Makefile targets:
+  - `kind-create`
+  - `k8s-demo-images`
+  - `k8s-demo-stack`
+  - `k8s-demo-resources`
+  - `k8s-demo-seed`
+  - `k8s-demo-drift`
+  - `k8s-demo-force-drift-check`
+  - `k8s-demo-reset-slo`
+  - `k8s-demo-wait-checks`
+  - `k8s-demo-status`
+  - `k8s-demo`
+- The seed and drift steps now run from Kubernetes pods using the same checker image and in-cluster service DNS.
+- Fixed two manifest issues found during live validation:
+  - OpenSearch port names must be at most 15 characters.
+  - Redpanda must use the image entrypoint with `redpanda start` arguments, matching the Compose path.
+
+What this fixes:
+
+```text
+The intended Kubernetes demo no longer depends on Compose services reachable through host.docker.internal.
+The DataSource, DerivedView, Invariant, RepairPolicy, checker Jobs, operator, and demo data systems can all live in one kind cluster.
+The demo is closer to a real platform control-plane proof, while still using ephemeral demo storage.
+```
+
+What remains intentionally open:
+
+```text
+The demo data systems use emptyDir storage and single-node deployments; this is not a production database/operator install.
+The full runtime proof still depends on local Docker/Colima availability.
+Production repair strategies beyond owner-executed events and unsafe demo reindex remain future work.
+```
+
+Runtime verification for this Kubernetes-native demo pass:
+
+```text
+kind delete cluster --name kubedataguard && make k8s-demo
+  Passed
+
+Data stack rollout:
+  dataguard-postgres: Ready 1/1
+  dataguard-redpanda: Ready 1/1
+  dataguard-opensearch: Ready 1/1
+
+In-cluster seed pod:
+  init --reset succeeded
+  generated 50 orders
+
+In-cluster drift pod:
+  processed 50 events
+  indexed 42 documents
+  deliberately skipped 8 paid orders
+
+Operator/checker result:
+  paid-orders-indexed: DriftDetected, driftCount=8
+  paid-orders-aggregate: DriftDetected, driftCount=2
+  paid-orders-freshness: Healthy, driftCount=0
+  paid-orders-query-check: Healthy, driftCount=0
+
+All checker Jobs completed after the final status settled.
+```
+
 ## First Build Target
 
 Runtime-verify the local runnable demo:
@@ -951,10 +1027,17 @@ Every paid order in Postgres must exist in OpenSearch within 60 seconds.
   - scheduled checker Jobs used `checkID` values like `g1-t5937886`
   - all four invariants were `Healthy`
   - query report ConfigMap contained compact `status.json` and `repair-input.json` keys
+- Kubernetes-native demo stack run:
+  - Passed from a fresh kind cluster
+  - Postgres, Redpanda, and OpenSearch ran inside kind
+  - seed and drift worker pods ran inside kind
+  - operator checker Jobs used in-cluster service DNS from DataSource/DerivedView Secrets
+  - `paid-orders-indexed` reported `DriftDetected`, `driftCount=8`
+  - `paid-orders-aggregate` reported `DriftDetected`, `driftCount=2`
 
 ## Verification Not Completed
 
-- A Kubernetes-native Postgres/Redpanda/OpenSearch demo stack has not been added yet; the current kind proof reaches the Compose services through `host.docker.internal`.
+- A Kubernetes-native Postgres/Redpanda/OpenSearch demo stack has been added; production-grade stateful storage and Helm/operator installs are intentionally out of scope for the demo.
 - Source-of-truth reindex repair is implemented for existence and freshness drift. Broader repair strategies such as Kafka replay, cache invalidation, and aggregate backfill are not implemented yet.
 - Secret-backed worker env wiring and DataSource/DerivedView watch fan-out are implemented; immediate Secret rotation fan-out is not implemented yet.
 - The generic query runner is intentionally limited to Postgres source queries and OpenSearch JSON target queries.
@@ -1126,14 +1209,13 @@ Expected behavior:
    - repair Job crash before report publication
    - repair retry/idempotency
    - stale/corrupt target document
-2. Build a Kubernetes-native demo stack so kind does not depend on Compose services.
-3. Add CDC/log watermark proof for Postgres -> Kafka -> OpenSearch frontiers.
-4. Add repair strategies beyond source-of-truth reindexing:
+2. Add CDC/log watermark proof for Postgres -> Kafka -> OpenSearch frontiers.
+3. Add repair strategies beyond source-of-truth reindexing:
    - Kafka replay
    - Redis invalidation
    - ClickHouse aggregate backfill
-5. Add a second source/derived pair to prove the CRD abstraction beyond OpenSearch.
-6. Add Secret rotation fan-out or document that scheduled checks are the refresh boundary.
+4. Add a second source/derived pair to prove the CRD abstraction beyond OpenSearch.
+5. Add Secret rotation fan-out or document that scheduled checks are the refresh boundary.
 
 ## Open Questions
 

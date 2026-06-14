@@ -4,7 +4,7 @@ metadata:
   name: orders-postgres-secret
 type: Opaque
 stringData:
-  dsn: postgresql://dataguard:dataguard@host.docker.internal:5432/dataguard
+  dsn: postgresql://dataguard:dataguard@dataguard-postgres:5432/dataguard
 ---
 apiVersion: v1
 kind: Secret
@@ -12,7 +12,7 @@ metadata:
   name: orders-opensearch-secret
 type: Opaque
 stringData:
-  url: http://host.docker.internal:9200
+  url: http://dataguard-opensearch:9200
 ---
 apiVersion: v1
 kind: Secret
@@ -20,7 +20,7 @@ metadata:
   name: orders-kafka-secret
 type: Opaque
 stringData:
-  bootstrapServers: host.docker.internal:19092
+  bootstrapServers: dataguard-redpanda:9092
 ---
 apiVersion: dataguard.io/v1alpha1
 kind: DataSource

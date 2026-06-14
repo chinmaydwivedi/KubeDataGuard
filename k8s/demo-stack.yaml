@@ -1,0 +1,243 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataguard-postgres
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: postgres
+spec:
+  selector:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dataguard-postgres
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: postgres
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubedataguard
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubedataguard
+        app.kubernetes.io/component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: dataguard
+            - name: POSTGRES_USER
+              value: dataguard
+            - name: POSTGRES_PASSWORD
+              value: dataguard
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - dataguard
+                - -d
+                - dataguard
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 20
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: postgres-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataguard-redpanda
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: redpanda
+spec:
+  selector:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: redpanda
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    - name: schema-registry
+      port: 8081
+      targetPort: schema-registry
+    - name: pandaproxy
+      port: 8082
+      targetPort: pandaproxy
+    - name: admin
+      port: 9644
+      targetPort: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dataguard-redpanda
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: redpanda
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubedataguard
+      app.kubernetes.io/component: redpanda
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubedataguard
+        app.kubernetes.io/component: redpanda
+    spec:
+      containers:
+        - name: redpanda
+          image: docker.redpanda.com/redpandadata/redpanda:v26.1.9
+          imagePullPolicy: IfNotPresent
+          args:
+            - redpanda
+            - start
+            - --kafka-addr
+            - internal://0.0.0.0:9092
+            - --advertise-kafka-addr
+            - internal://dataguard-redpanda:9092
+            - --pandaproxy-addr
+            - internal://0.0.0.0:8082
+            - --advertise-pandaproxy-addr
+            - internal://dataguard-redpanda:8082
+            - --schema-registry-addr
+            - internal://0.0.0.0:8081
+            - --rpc-addr
+            - 0.0.0.0:33145
+            - --advertise-rpc-addr
+            - dataguard-redpanda:33145
+            - --mode
+            - dev-container
+            - --smp
+            - "1"
+            - --default-log-level=info
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: schema-registry
+              containerPort: 8081
+            - name: pandaproxy
+              containerPort: 8082
+            - name: admin
+              containerPort: 9644
+          readinessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          volumeMounts:
+            - name: redpanda-data
+              mountPath: /var/lib/redpanda/data
+      volumes:
+        - name: redpanda-data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dataguard-opensearch
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: opensearch
+spec:
+  selector:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: opensearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: http
+    - name: perf-analyzer
+      port: 9600
+      targetPort: perf-analyzer
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dataguard-opensearch
+  labels:
+    app.kubernetes.io/name: kubedataguard
+    app.kubernetes.io/component: opensearch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubedataguard
+      app.kubernetes.io/component: opensearch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubedataguard
+        app.kubernetes.io/component: opensearch
+    spec:
+      initContainers:
+        - name: set-vm-max-map-count
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - sysctl -w vm.max_map_count=262144
+          securityContext:
+            privileged: true
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9200
+            - name: perf-analyzer
+              containerPort: 9600
+          env:
+            - name: discovery.type
+              value: single-node
+            - name: plugins.security.disabled
+              value: "true"
+            - name: DISABLE_INSTALL_DEMO_CONFIG
+              value: "true"
+            - name: OPENSEARCH_JAVA_OPTS
+              value: "-Xms512m -Xmx512m"
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          volumeMounts:
+            - name: opensearch-data
+              mountPath: /usr/share/opensearch/data
+      volumes:
+        - name: opensearch-data
+          emptyDir: {}

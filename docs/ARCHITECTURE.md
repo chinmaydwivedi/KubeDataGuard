@@ -12,7 +12,7 @@ There are now three execution modes:
 
 - `demo-local`: deterministic no-Docker proof that models Postgres source rows and OpenSearch documents in memory.
 - Compose demo: real Postgres, Redpanda, and OpenSearch integration.
-- Kubernetes job-backed demo: a Go operator in kind creates scheduled Python checker and repair Jobs that connect to the Compose data systems and publish compact status ConfigMaps.
+- Kubernetes job-backed demo: kind runs Postgres, Redpanda, OpenSearch, the Go operator, and scheduled Python checker/repair Jobs in-cluster.
 
 All three modes use the same invariant/report semantics. The local proof is not the final runtime target; it is a fast, dependency-light way to prove the control loop.
 
@@ -137,7 +137,7 @@ repair command
 
 operator check-job path
   |
-  |-- watch Invariant resources
+  |-- watch Invariant, DataSource, and DerivedView resources
   |-- create one checker Job per Invariant generation or scheduled check interval
   |-- run the Python checker in Kubernetes
   |-- write full report to the worker report store or S3/MinIO
