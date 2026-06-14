@@ -1,3 +1,27 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orders-postgres-secret
+type: Opaque
+stringData:
+  dsn: postgresql://dataguard:dataguard@host.docker.internal:5432/dataguard
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orders-opensearch-secret
+type: Opaque
+stringData:
+  url: http://host.docker.internal:9200
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orders-kafka-secret
+type: Opaque
+stringData:
+  bootstrapServers: host.docker.internal:19092
+---
 apiVersion: dataguard.io/v1alpha1
 kind: DataSource
 metadata:
@@ -21,6 +45,7 @@ spec:
     index: orders
   pipeline:
     type: kafka
+    connectionSecret: orders-kafka-secret
     topic: orders.events
 ---
 apiVersion: dataguard.io/v1alpha1

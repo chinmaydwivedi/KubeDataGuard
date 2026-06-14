@@ -332,6 +332,23 @@ The controller creates or ensures:
 
 Full drift evidence is not stored in `Invariant.status` or ConfigMap payloads. The worker writes complete JSON/Markdown artifacts to `REPORT_DIR` and, when configured with `REPORT_STORE=s3`, uploads the same evidence to an S3-compatible store. Kubernetes status carries the compact phase plus `reportRef`.
 
+Before a job-backed check starts, the controller resolves:
+
+```text
+Invariant.spec.derivedViewRef
+  -> DerivedView.spec.sourceRef
+  -> DataSource.spec.connectionSecret
+  -> worker POSTGRES_DSN secretKeyRef
+
+DerivedView.spec.target.connectionSecret
+  -> worker OPENSEARCH_URL secretKeyRef
+
+DerivedView.spec.pipeline.connectionSecret
+  -> worker KAFKA_BOOTSTRAP_SERVERS secretKeyRef
+```
+
+The operator injects `valueFrom.secretKeyRef` into the checker and repair Jobs. It does not copy credential values into CRD status, ConfigMaps, or annotations. Annotation/default connection values still exist as a local-development fallback, but the CRD path is now the primary Kubernetes path.
+
 Scheduled invariants use `spec.checkIntervalSeconds`. The controller computes a `checkID` from the invariant generation and the current interval slot. That gives repeated checks without duplicate Jobs inside the same interval.
 
 The first generic query path is intentionally scoped:

@@ -20,6 +20,7 @@ What is implemented and verified:
 - Compact Kubernetes status handoff through ConfigMaps.
 - Full JSON/Markdown reports written to the worker report store and referenced from status.
 - Optional S3/MinIO-compatible durable report publication with `s3://...` status refs.
+- Kubernetes Secret-backed connection env resolution through `DataSource` and `DerivedView` resources.
 - Direct source-of-truth reindex repair for explicit local demos.
 - Safer reconciliation-event repair mode for owner-executed remediation.
 - Operator safeguards that avoid status churn for repeated healthy scheduled checks.
@@ -29,7 +30,6 @@ What is intentionally not solved yet:
 - Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
 - Full DBLog-style CDC watermarks and crash-exact scan recovery.
 - Object-store lifecycle policy, retention, encryption, and report compaction.
-- Kubernetes Secret-backed connection loading from `DataSource` resources.
 - Production repair integrations such as Kafka replay, webhook dispatch, cache invalidation, and analytics backfill.
 
 ## Architectural Boundary
@@ -299,6 +299,7 @@ metadata:
 spec:
   type: postgres
   connectionSecret: orders-postgres-secret
+  connectionSecretKey: dsn
   database: commerce
 ```
 
@@ -314,11 +315,14 @@ metadata:
 spec:
   sourceRef: orders-postgres
   target:
-    type: elasticsearch
+    type: opensearch
     connectionSecret: search-secret
+    connectionSecretKey: url
     index: orders
   pipeline:
     type: kafka
+    connectionSecret: kafka-secret
+    bootstrapServersKey: bootstrapServers
     topic: order-events
 ```
 
@@ -415,7 +419,7 @@ The mature operator loop:
 
 ```text
 1. Watch DataSource, DerivedView, Invariant, and RepairPolicy objects.
-2. Load connection details from Kubernetes Secrets.
+2. Resolve connection env vars from `DataSource` and `DerivedView` Secret references.
 3. Run source and target checks.
 4. Compare results.
 5. Classify drift:

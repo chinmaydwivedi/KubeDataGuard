@@ -32,6 +32,18 @@ var InvariantGVK = schema.GroupVersionKind{
 	Kind:    "Invariant",
 }
 
+var DataSourceGVK = schema.GroupVersionKind{
+	Group:   "dataguard.io",
+	Version: "v1alpha1",
+	Kind:    "DataSource",
+}
+
+var DerivedViewGVK = schema.GroupVersionKind{
+	Group:   "dataguard.io",
+	Version: "v1alpha1",
+	Kind:    "DerivedView",
+}
+
 var RepairPolicyGVK = schema.GroupVersionKind{
 	Group:   "dataguard.io",
 	Version: "v1alpha1",

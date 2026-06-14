@@ -10,7 +10,7 @@ metadata:
   name: kubedataguard-operator
 rules:
   - apiGroups: ["dataguard.io"]
-    resources: ["invariants", "repairpolicies"]
+    resources: ["datasources", "derivedviews", "invariants", "repairpolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["dataguard.io"]
     resources: ["invariants/status"]

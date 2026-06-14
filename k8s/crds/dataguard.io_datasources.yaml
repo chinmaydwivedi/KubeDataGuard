@@ -30,6 +30,9 @@ spec:
                   enum: ["postgres", "kafka", "redis", "opensearch", "clickhouse"]
                 connectionSecret:
                   type: string
+                connectionSecretKey:
+                  type: string
+                  default: dsn
                 database:
                   type: string
                 tables:
@@ -39,4 +42,3 @@ spec:
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
-

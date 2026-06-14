@@ -138,6 +138,16 @@ kubectl apply -f k8s/crds
 kubectl apply -f examples/commerce-consistency.yaml
 ```
 
+The example resources include demo Kubernetes Secrets:
+
+```text
+orders-postgres-secret: dsn
+orders-opensearch-secret: url
+orders-kafka-secret: bootstrapServers
+```
+
+In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`.
+
 Run the operator locally against kind:
 
 ```sh

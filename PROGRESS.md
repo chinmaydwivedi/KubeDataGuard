@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, and persisted source-scan checkpoints.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, and Secret-backed DataSource/DerivedView connection resolution.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs, example resources, a kind cluster verification path, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars, example resources, a kind cluster verification path, and deeper docs.
 
 ## Decisions Made
 
@@ -530,7 +530,6 @@ What remains intentionally open:
 generic query support is currently Postgres -> OpenSearch only
 full DBLog-style watermarks, CDC/log-bound scan completion, and crash-exact scan recovery still need implementation
 object-store reports still need retention, encryption, lifecycle policy, and compaction
-DataSource connectionSecret is still not wired into Jobs
 production repair dispatch beyond local JSONL reconciliation events remains future work
 ```
 
@@ -698,6 +697,89 @@ REPORT_STORE=s3 ... docker compose run --rm dataguard check --invariant query --
   Passed: MinIO contains scan-checkpoints/demo-paid-orders-query-s3.json
 ```
 
+## Latest Secret Resolution Pass
+
+Implemented the next response to the "demo annotations are not production wiring" critique.
+
+What changed:
+
+- Added `DataSource` and `DerivedView` GVKs to the Go controller.
+- The job-backed reconciler now resolves:
+  - `Invariant.spec.derivedViewRef`
+  - `DerivedView.spec.sourceRef`
+  - `DataSource.spec.connectionSecret`
+  - `DerivedView.spec.target.connectionSecret`
+  - `DerivedView.spec.pipeline.connectionSecret`
+- Checker and repair Jobs now receive connection variables through `valueFrom.secretKeyRef` when CRD resources provide Secrets:
+  - `POSTGRES_DSN`
+  - `OPENSEARCH_URL`
+  - `KAFKA_BOOTSTRAP_SERVERS`
+- Non-secret routing still comes from CRDs:
+  - `ORDERS_INDEX`
+  - `ORDER_EVENTS_TOPIC`
+- Added CRD fields for explicit secret key names:
+  - `DataSource.spec.connectionSecretKey`, default `dsn`
+  - `DerivedView.spec.target.connectionSecretKey`, default `url`
+  - `DerivedView.spec.pipeline.bootstrapServersKey`, default `bootstrapServers`
+- Added demo Secrets to `examples/commerce-consistency.yaml`.
+- Updated operator RBAC to read `datasources` and `derivedviews`.
+- Kept annotation/default connection values as a local-development fallback.
+
+What this fixes:
+
+```text
+DataSource and DerivedView are now runtime inputs to the operator, not just documentation sketches.
+Connection credentials no longer need to be copied into annotations for the Kubernetes path.
+Credential values do not enter CRD status, report ConfigMaps, or operator logs through this resolver.
+```
+
+What remains intentionally open:
+
+```text
+The operator does not yet watch DataSource/DerivedView changes and fan out reconciles to affected Invariants.
+Secret rotation behavior is delegated to the next scheduled Job; there is no immediate restart/refresh mechanism.
+Report-store credentials still rely on pod environment/platform identity rather than a ReportStore CRD.
+```
+
+Verification for this Secret-resolution pass:
+
+```text
+PYTHONPATH=src python3 -m unittest discover -s tests
+  Passed: 24 tests
+
+python3 -m py_compile $(find src -name '*.py' | sort)
+  Passed
+
+go test ./...
+  Passed
+
+ruby YAML parse for Compose, CRDs, operator manifest, and examples
+  Passed
+
+docker compose build dataguard
+  Passed
+
+go build -o /tmp/dataguard-operator ./cmd/dataguard-operator
+  Passed
+
+kubectl apply -f k8s/crds && kubectl apply -f examples/commerce-consistency.yaml
+  Passed: demo Secrets, DataSource, DerivedView, Invariants, and RepairPolicies applied
+
+local /tmp/dataguard-operator run against kind
+  Passed: created checker Jobs and patched paid-orders-indexed + paid-orders-query-check to Healthy
+
+kubectl get job dataguard-check-paid-orders-indexed-g12-t5938044 -o jsonpath=...
+  Passed: POSTGRES_DSN came from orders-postgres-secret/dsn
+  Passed: KAFKA_BOOTSTRAP_SERVERS came from orders-kafka-secret/bootstrapServers
+  Passed: OPENSEARCH_URL came from orders-opensearch-secret/url
+  Passed: ORDERS_INDEX and ORDER_EVENTS_TOPIC remained non-secret CRD routing values
+
+Linux/arm64 operator image from verified binary loaded into kind
+  Passed: deployment kubedataguard-operator successfully rolled out and became Ready 1/1
+
+Note: the standard `Dockerfile.operator` legacy Docker build path hit local disk/legacy-builder issues during this pass. The live kind rollout used a Linux/arm64 operator binary built with Go and packaged into `kubedataguard-operator:latest`.
+```
+
 ## First Build Target
 
 Runtime-verify the local runnable demo:
@@ -826,9 +908,9 @@ Every paid order in Postgres must exist in OpenSearch within 60 seconds.
 
 - A Kubernetes-native Postgres/Redpanda/OpenSearch demo stack has not been added yet; the current kind proof reaches the Compose services through `host.docker.internal`.
 - Source-of-truth reindex repair is implemented for existence and freshness drift. Broader repair strategies such as Kafka replay, cache invalidation, and aggregate backfill are not implemented yet.
-- Secrets are still represented by CRD sketches and annotations/defaults for the demo; production-grade Secret wiring is not implemented yet.
+- Secret-backed worker env wiring is implemented for DataSource/DerivedView connections; watch fan-out on Secret/DataSource/DerivedView changes is not implemented yet.
 - The generic query runner is intentionally limited to Postgres source queries and OpenSearch JSON target queries.
-- Full report persistence still needs an object-store backend; the current Kubernetes path keeps ConfigMaps compact and uses file-style report references from the worker.
+- S3/MinIO-compatible report persistence is implemented; retention, encryption, lifecycle policy, and compaction are still open.
 
 ## Intermediate Roadmap Before Mature Operator
 
@@ -996,13 +1078,14 @@ Expected behavior:
    - repair Job crash before report publication
    - repair retry/idempotency
    - stale/corrupt target document
-2. Replace annotation/default connection settings with Kubernetes Secret references.
+2. Add watches or indexes so DataSource/DerivedView changes trigger affected Invariant reconciles.
 3. Build a Kubernetes-native demo stack so kind does not depend on Compose services.
-4. Add repair strategies beyond source-of-truth reindexing:
+4. Add CDC/log watermark proof for Postgres -> Kafka -> OpenSearch frontiers.
+5. Add repair strategies beyond source-of-truth reindexing:
    - Kafka replay
    - Redis invalidation
    - ClickHouse aggregate backfill
-5. Add a second source/derived pair to prove the CRD abstraction beyond OpenSearch.
+6. Add a second source/derived pair to prove the CRD abstraction beyond OpenSearch.
 
 ## Open Questions
 
@@ -1015,7 +1098,8 @@ Current answer:
 - Controller ConfigMaps now carry compact `status.json` plus `repair-input.json`.
 - `reportRef` now points at the worker report store path for full evidence reports.
 - S3/MinIO-compatible report and checkpoint storage is implemented.
-- Next blocking decisions: retention/lifecycle policy, encryption posture, and Secret-backed connection resolution.
+- Secret-backed DataSource/DerivedView connection resolution is implemented for worker Jobs.
+- Next blocking decisions: retention/lifecycle policy, encryption posture, and DataSource/DerivedView watch fan-out.
 
 ### Next Sprint
 
@@ -1028,7 +1112,8 @@ Current answer:
 - First generic Postgres/OpenSearch query invariant is implemented.
 - First keyset-paginated source scan path is implemented.
 - Persisted scan checkpoints are implemented for bounded keyset scans.
-- Next: CDC watermarks, Secret-backed `DataSource` resolution, and checksum/Merkle narrowing.
+- Secret-backed `DataSource` and `DerivedView` resolution is implemented for the job-backed operator.
+- Next: CDC watermarks, checksum/Merkle narrowing, and a second source/derived pair.
 
 ### Future
 

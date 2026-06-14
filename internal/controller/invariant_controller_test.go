@@ -1,10 +1,14 @@
 package controller
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestBuildSyntheticInvariantStatusDefaultsHealthy(t *testing.T) {
@@ -154,6 +158,61 @@ func TestBuildCheckerJobUsesInvariantConfiguration(t *testing.T) {
 	}
 	if env["AWS_REGION"] != "us-west-2" {
 		t.Fatalf("AWS_REGION = %q", env["AWS_REGION"])
+	}
+}
+
+func TestResolveCheckerEnvUsesDataSourceAndDerivedViewSecretRefs(t *testing.T) {
+	invariant := invariantObject("paid-orders-indexed", "existence", nil)
+	dataSource := dataSourceObject(
+		"orders-postgres",
+		"postgres",
+		"orders-postgres-secret",
+		map[string]any{"connectionSecretKey": "postgresDsn"},
+	)
+	derivedView := derivedViewObject(
+		"orders-search-index",
+		"orders-postgres",
+		map[string]any{
+			"target": map[string]any{
+				"type":                "opensearch",
+				"connectionSecret":    "orders-opensearch-secret",
+				"connectionSecretKey": "endpoint",
+				"index":               "orders-v2",
+			},
+			"pipeline": map[string]any{
+				"type":                "kafka",
+				"connectionSecret":    "orders-kafka-secret",
+				"bootstrapServersKey": "brokers",
+				"topic":               "orders.events.v2",
+			},
+		},
+	)
+	scheme := runtime.NewScheme()
+	reconciler := &InvariantReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(invariant, dataSource, derivedView).
+			Build(),
+	}
+
+	env, err := reconciler.resolveCheckerEnv(context.Background(), invariant)
+	if err != nil {
+		t.Fatalf("resolveCheckerEnv returned error: %v", err)
+	}
+	job, err := BuildCheckerJobWithEnv(invariant, CheckRun{ID: "g3"}, env)
+	if err != nil {
+		t.Fatalf("BuildCheckerJobWithEnv returned error: %v", err)
+	}
+
+	envMap := envByName(job.Spec.Template.Spec.Containers[0].Env)
+	assertSecretEnv(t, envMap["POSTGRES_DSN"], "orders-postgres-secret", "postgresDsn")
+	assertSecretEnv(t, envMap["OPENSEARCH_URL"], "orders-opensearch-secret", "endpoint")
+	assertSecretEnv(t, envMap["KAFKA_BOOTSTRAP_SERVERS"], "orders-kafka-secret", "brokers")
+	if envMap["ORDERS_INDEX"].Value != "orders-v2" {
+		t.Fatalf("ORDERS_INDEX = %q, want orders-v2", envMap["ORDERS_INDEX"].Value)
+	}
+	if envMap["ORDER_EVENTS_TOPIC"].Value != "orders.events.v2" {
+		t.Fatalf("ORDER_EVENTS_TOPIC = %q, want orders.events.v2", envMap["ORDER_EVENTS_TOPIC"].Value)
 	}
 }
 
@@ -478,6 +537,51 @@ func invariantObject(name string, invariantType string, annotations map[string]s
 	return obj
 }
 
+func dataSourceObject(name string, sourceType string, connectionSecret string, extraSpec map[string]any) *unstructured.Unstructured {
+	spec := map[string]any{
+		"type":             sourceType,
+		"connectionSecret": connectionSecret,
+	}
+	for key, value := range extraSpec {
+		spec[key] = value
+	}
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "dataguard.io/v1alpha1",
+			"kind":       "DataSource",
+			"metadata": map[string]any{
+				"name":      name,
+				"namespace": "default",
+			},
+			"spec": spec,
+		},
+	}
+	obj.SetGroupVersionKind(DataSourceGVK)
+	return obj
+}
+
+func derivedViewObject(name string, sourceRef string, specOverrides map[string]any) *unstructured.Unstructured {
+	spec := map[string]any{
+		"sourceRef": sourceRef,
+	}
+	for key, value := range specOverrides {
+		spec[key] = value
+	}
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "dataguard.io/v1alpha1",
+			"kind":       "DerivedView",
+			"metadata": map[string]any{
+				"name":      name,
+				"namespace": "default",
+			},
+			"spec": spec,
+		},
+	}
+	obj.SetGroupVersionKind(DerivedViewGVK)
+	return obj
+}
+
 func repairPolicyObject(invariantRef string, approvalRequired bool, actionType string) *unstructured.Unstructured {
 	obj := &unstructured.Unstructured{
 		Object: map[string]any{
@@ -498,6 +602,30 @@ func repairPolicyObject(invariantRef string, approvalRequired bool, actionType s
 	}
 	obj.SetGroupVersionKind(RepairPolicyGVK)
 	return obj
+}
+
+func envByName(env []corev1.EnvVar) map[string]corev1.EnvVar {
+	values := map[string]corev1.EnvVar{}
+	for _, item := range env {
+		values[item.Name] = item
+	}
+	return values
+}
+
+func assertSecretEnv(t *testing.T, env corev1.EnvVar, secretName string, secretKey string) {
+	t.Helper()
+	if env.Value != "" {
+		t.Fatalf("%s has literal value %q, want secret ref", env.Name, env.Value)
+	}
+	if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("%s is missing secret key ref", env.Name)
+	}
+	if env.ValueFrom.SecretKeyRef.Name != secretName {
+		t.Fatalf("%s secret name = %q, want %q", env.Name, env.ValueFrom.SecretKeyRef.Name, secretName)
+	}
+	if env.ValueFrom.SecretKeyRef.Key != secretKey {
+		t.Fatalf("%s secret key = %q, want %q", env.Name, env.ValueFrom.SecretKeyRef.Key, secretKey)
+	}
 }
 
 func contains(values []string, want string) bool {

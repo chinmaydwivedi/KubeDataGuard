@@ -54,6 +54,9 @@ const (
 	DefaultReportStore           = "local"
 	DefaultReportPrefix          = "kubedataguard/reports"
 	DefaultAWSRegion             = "us-east-1"
+	DefaultPostgresSecretKey     = "dsn"
+	DefaultOpenSearchSecretKey   = "url"
+	DefaultKafkaSecretKey        = "bootstrapServers"
 )
 
 type CheckRun struct {
@@ -133,7 +136,11 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 	job := &batchv1.Job{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: invariant.GetNamespace(), Name: jobName}, job)
 	if apierrors.IsNotFound(err) {
-		job, err := BuildCheckerJob(invariant, run)
+		env, err := r.resolveCheckerEnv(ctx, invariant)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		job, err := BuildCheckerJobWithEnv(invariant, run, env)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -246,7 +253,11 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 	err = r.Get(ctx, types.NamespacedName{Namespace: invariant.GetNamespace(), Name: jobName}, job)
 	driftCount, _ := int64Field(driftStatus, "driftCount")
 	if apierrors.IsNotFound(err) {
-		job, err := BuildRepairJob(invariant, checkReportConfigMapName, run)
+		env, err := r.resolveCheckerEnv(ctx, invariant)
+		if err != nil {
+			return ctrl.Result{}, true, err
+		}
+		job, err := BuildRepairJobWithEnv(invariant, checkReportConfigMapName, run, env)
 		if err != nil {
 			return ctrl.Result{}, true, err
 		}
@@ -357,6 +368,14 @@ func repairPolicyAllowsAutoReindex(policy *unstructured.Unstructured) (bool, err
 }
 
 func BuildCheckerJob(invariant *unstructured.Unstructured, run CheckRun) (*batchv1.Job, error) {
+	return BuildCheckerJobWithEnv(invariant, run, checkerEnv(invariant))
+}
+
+func BuildCheckerJobWithEnv(
+	invariant *unstructured.Unstructured,
+	run CheckRun,
+	env []corev1.EnvVar,
+) (*batchv1.Job, error) {
 	maxLagSeconds, err := maxLagSeconds(invariant)
 	if err != nil {
 		return nil, err
@@ -402,7 +421,7 @@ func BuildCheckerJob(invariant *unstructured.Unstructured, run CheckRun) (*batch
 							Image:           annotationOrDefault(invariant, AnnotationCheckerImage, DefaultCheckerImage),
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Args:            args,
-							Env:             checkerEnv(invariant),
+							Env:             env,
 						},
 					},
 				},
@@ -412,6 +431,15 @@ func BuildCheckerJob(invariant *unstructured.Unstructured, run CheckRun) (*batch
 }
 
 func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapName string, run CheckRun) (*batchv1.Job, error) {
+	return BuildRepairJobWithEnv(invariant, sourceReportConfigMapName, run, checkerEnv(invariant))
+}
+
+func BuildRepairJobWithEnv(
+	invariant *unstructured.Unstructured,
+	sourceReportConfigMapName string,
+	run CheckRun,
+	env []corev1.EnvVar,
+) (*batchv1.Job, error) {
 	maxLagSeconds, err := maxLagSeconds(invariant)
 	if err != nil {
 		return nil, err
@@ -459,7 +487,7 @@ func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapN
 							Image:           repairImage(invariant),
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Args:            args,
-							Env:             checkerEnv(invariant),
+							Env:             env,
 						},
 					},
 				},
@@ -715,6 +743,109 @@ func shouldPatchCheckerRunningStatus(invariant *unstructured.Unstructured) bool 
 	return phase != PhaseHealthy && phase != PhaseDriftDetected
 }
 
+func (r *InvariantReconciler) resolveCheckerEnv(
+	ctx context.Context,
+	invariant *unstructured.Unstructured,
+) ([]corev1.EnvVar, error) {
+	env := checkerEnv(invariant)
+	derivedViewName := derivedViewRef(invariant)
+	if derivedViewName == "" {
+		return env, nil
+	}
+
+	derivedView := &unstructured.Unstructured{}
+	derivedView.SetGroupVersionKind(DerivedViewGVK)
+	key := types.NamespacedName{Namespace: invariant.GetNamespace(), Name: derivedViewName}
+	if err := r.Get(ctx, key, derivedView); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("Invariant %s/%s references missing DerivedView %s", invariant.GetNamespace(), invariant.GetName(), derivedViewName)
+		}
+		return nil, err
+	}
+
+	sourceRef, _, err := unstructured.NestedString(derivedView.Object, "spec", "sourceRef")
+	if err != nil {
+		return nil, fmt.Errorf("read DerivedView %s spec.sourceRef: %w", derivedView.GetName(), err)
+	}
+	if sourceRef != "" {
+		dataSource := &unstructured.Unstructured{}
+		dataSource.SetGroupVersionKind(DataSourceGVK)
+		dataSourceKey := types.NamespacedName{Namespace: invariant.GetNamespace(), Name: sourceRef}
+		if err := r.Get(ctx, dataSourceKey, dataSource); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, fmt.Errorf("DerivedView %s/%s references missing DataSource %s", derivedView.GetNamespace(), derivedView.GetName(), sourceRef)
+			}
+			return nil, err
+		}
+		env = applyDataSourceEnv(env, dataSource)
+	}
+
+	env = applyDerivedViewEnv(env, derivedView)
+	return env, nil
+}
+
+func applyDataSourceEnv(env []corev1.EnvVar, dataSource *unstructured.Unstructured) []corev1.EnvVar {
+	sourceType, _, _ := unstructured.NestedString(dataSource.Object, "spec", "type")
+	connectionSecret, _, _ := unstructured.NestedString(dataSource.Object, "spec", "connectionSecret")
+	if sourceType == "postgres" && connectionSecret != "" {
+		secretKey := nestedStringOrDefault(dataSource, DefaultPostgresSecretKey, "spec", "connectionSecretKey")
+		env = upsertEnvVar(env, secretEnvVar("POSTGRES_DSN", connectionSecret, secretKey))
+	}
+	return env
+}
+
+func applyDerivedViewEnv(env []corev1.EnvVar, derivedView *unstructured.Unstructured) []corev1.EnvVar {
+	targetType, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "type")
+	targetSecret, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "connectionSecret")
+	if targetType == "opensearch" && targetSecret != "" {
+		secretKey := nestedStringOrDefault(derivedView, DefaultOpenSearchSecretKey, "spec", "target", "connectionSecretKey")
+		env = upsertEnvVar(env, secretEnvVar("OPENSEARCH_URL", targetSecret, secretKey))
+	}
+	if index, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "index"); index != "" {
+		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDERS_INDEX", Value: index})
+	}
+	if topic, _, _ := unstructured.NestedString(derivedView.Object, "spec", "pipeline", "topic"); topic != "" {
+		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDER_EVENTS_TOPIC", Value: topic})
+	}
+	pipelineType, _, _ := unstructured.NestedString(derivedView.Object, "spec", "pipeline", "type")
+	pipelineSecret, _, _ := unstructured.NestedString(derivedView.Object, "spec", "pipeline", "connectionSecret")
+	if pipelineType == "kafka" && pipelineSecret != "" {
+		secretKey := nestedStringOrDefault(derivedView, DefaultKafkaSecretKey, "spec", "pipeline", "bootstrapServersKey")
+		env = upsertEnvVar(env, secretEnvVar("KAFKA_BOOTSTRAP_SERVERS", pipelineSecret, secretKey))
+	}
+	return env
+}
+
+func secretEnvVar(name string, secretName string, secretKey string) corev1.EnvVar {
+	return corev1.EnvVar{
+		Name: name,
+		ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+				Key:                  secretKey,
+			},
+		},
+	}
+}
+
+func upsertEnvVar(env []corev1.EnvVar, value corev1.EnvVar) []corev1.EnvVar {
+	for index := range env {
+		if env[index].Name == value.Name {
+			env[index] = value
+			return env
+		}
+	}
+	return append(env, value)
+}
+
+func nestedStringOrDefault(obj *unstructured.Unstructured, fallback string, fields ...string) string {
+	value, found, _ := unstructured.NestedString(obj.Object, fields...)
+	if !found || value == "" {
+		return fallback
+	}
+	return value
+}
+
 func checkerEnv(invariant *unstructured.Unstructured) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "POSTGRES_DSN", Value: annotationOrDefault(invariant, AnnotationPostgresDSN, DefaultPostgresDSN)},
@@ -806,6 +937,11 @@ func maxLagSeconds(invariant *unstructured.Unstructured) (int64, error) {
 func invariantType(invariant *unstructured.Unstructured) string {
 	invariantType, _, _ := unstructured.NestedString(invariant.Object, "spec", "type")
 	return invariantType
+}
+
+func derivedViewRef(invariant *unstructured.Unstructured) string {
+	value, _, _ := unstructured.NestedString(invariant.Object, "spec", "derivedViewRef")
+	return value
 }
 
 func sourceQuery(invariant *unstructured.Unstructured) string {

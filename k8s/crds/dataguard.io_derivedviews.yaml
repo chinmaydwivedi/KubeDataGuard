@@ -37,6 +37,9 @@ spec:
                       type: string
                     connectionSecret:
                       type: string
+                    connectionSecretKey:
+                      type: string
+                      default: url
                     index:
                       type: string
                     table:
@@ -46,9 +49,13 @@ spec:
                   properties:
                     type:
                       type: string
+                    connectionSecret:
+                      type: string
+                    bootstrapServersKey:
+                      type: string
+                      default: bootstrapServers
                     topic:
                       type: string
             status:
               type: object
               x-kubernetes-preserve-unknown-fields: true
-
