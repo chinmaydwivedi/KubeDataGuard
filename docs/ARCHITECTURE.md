@@ -306,7 +306,7 @@ The first direct repair strategy is implemented for `reindex-records`, but autom
 ```text
 Invariant CRD
   |
-  |-- Go/controller-runtime watch
+  |-- Go/controller-runtime watch on Invariant, DataSource, DerivedView
   |-- unstructured reconciler
   |-- deterministic checker Job for this generation/checkID
   |-- Python checker runs against Postgres/Redpanda/OpenSearch
@@ -348,6 +348,8 @@ DerivedView.spec.pipeline.connectionSecret
 ```
 
 The operator injects `valueFrom.secretKeyRef` into the checker and repair Jobs. It does not copy credential values into CRD status, ConfigMaps, or annotations. Annotation/default connection values still exist as a local-development fallback, but the CRD path is now the primary Kubernetes path.
+
+`DataSource` and `DerivedView` are watched topology resources. A `DerivedView` change enqueues the `Invariant`s that reference it. A `DataSource` change first finds derived views with that `sourceRef`, then enqueues the invariants attached to those derived views. Secret changes are not watched yet; the current refresh boundary for rotated credentials is the next scheduled check or another topology/invariant reconcile.
 
 Scheduled invariants use `spec.checkIntervalSeconds`. The controller computes a `checkID` from the invariant generation and the current interval slot. That gives repeated checks without duplicate Jobs inside the same interval.
 

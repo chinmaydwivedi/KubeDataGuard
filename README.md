@@ -21,6 +21,7 @@ What is implemented and verified:
 - Full JSON/Markdown reports written to the worker report store and referenced from status.
 - Optional S3/MinIO-compatible durable report publication with `s3://...` status refs.
 - Kubernetes Secret-backed connection env resolution through `DataSource` and `DerivedView` resources.
+- `DataSource` and `DerivedView` watch fan-out to dependent `Invariant` reconciles.
 - Direct source-of-truth reindex repair for explicit local demos.
 - Safer reconciliation-event repair mode for owner-executed remediation.
 - Operator safeguards that avoid status churn for repeated healthy scheduled checks.
@@ -271,7 +272,8 @@ Current closed-loop operator path:
 
 - `cmd/dataguard-operator`: controller-runtime manager entrypoint
 - `internal/controller`: unstructured `Invariant` reconciler
-- watches `dataguard.io/v1alpha1` `Invariant` resources
+- watches `dataguard.io/v1alpha1` `Invariant`, `DataSource`, and `DerivedView` resources
+- maps `DerivedView` changes to referencing `Invariant`s and maps `DataSource` changes through dependent `DerivedView`s
 - supports `dataguard.io/checker-mode=job`
 - creates checker Jobs per `Invariant` generation or scheduled check interval
 - runs the Python checker against Postgres, Redpanda/Kafka, and OpenSearch

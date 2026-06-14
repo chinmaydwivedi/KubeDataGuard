@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"time"
 
@@ -10,8 +11,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
@@ -117,10 +121,108 @@ func (r *InvariantReconciler) patchInvariantStatus(
 func (r *InvariantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	invariant := &unstructured.Unstructured{}
 	invariant.SetGroupVersionKind(InvariantGVK)
+	dataSource := &unstructured.Unstructured{}
+	dataSource.SetGroupVersionKind(DataSourceGVK)
+	derivedView := &unstructured.Unstructured{}
+	derivedView.SetGroupVersionKind(DerivedViewGVK)
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(invariant).
 		Owns(&batchv1.Job{}).
+		Watches(dataSource, handler.EnqueueRequestsFromMapFunc(r.invariantsForDataSource)).
+		Watches(derivedView, handler.EnqueueRequestsFromMapFunc(r.invariantsForDerivedView)).
 		Complete(r)
+}
+
+func (r *InvariantReconciler) invariantsForDataSource(ctx context.Context, obj client.Object) []reconcile.Request {
+	log := ctrl.LoggerFrom(ctx)
+	derivedViews := &unstructured.UnstructuredList{}
+	derivedViews.SetGroupVersionKind(DerivedViewGVK.GroupVersion().WithKind("DerivedViewList"))
+	if err := r.List(ctx, derivedViews, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.Error(err, "list derived views for datasource fan-out", "dataSource", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+
+	derivedViewNames := map[string]struct{}{}
+	for i := range derivedViews.Items {
+		derivedView := &derivedViews.Items[i]
+		sourceRef, _, err := unstructured.NestedString(derivedView.Object, "spec", "sourceRef")
+		if err != nil {
+			log.Error(err, "read derived view sourceRef", "derivedView", client.ObjectKeyFromObject(derivedView))
+			continue
+		}
+		if sourceRef == obj.GetName() {
+			derivedViewNames[derivedView.GetName()] = struct{}{}
+		}
+	}
+	if len(derivedViewNames) == 0 {
+		return nil
+	}
+
+	requests, err := r.invariantRequestsForDerivedViewNames(ctx, obj.GetNamespace(), derivedViewNames)
+	if err != nil {
+		log.Error(err, "map datasource update to invariant reconciles", "dataSource", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+	return requests
+}
+
+func (r *InvariantReconciler) invariantsForDerivedView(ctx context.Context, obj client.Object) []reconcile.Request {
+	log := ctrl.LoggerFrom(ctx)
+	requests, err := r.invariantRequestsForDerivedViewNames(
+		ctx,
+		obj.GetNamespace(),
+		map[string]struct{}{obj.GetName(): {}},
+	)
+	if err != nil {
+		log.Error(err, "map derived view update to invariant reconciles", "derivedView", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+	return requests
+}
+
+func (r *InvariantReconciler) invariantRequestsForDerivedViewNames(
+	ctx context.Context,
+	namespace string,
+	derivedViewNames map[string]struct{},
+) ([]reconcile.Request, error) {
+	invariants := &unstructured.UnstructuredList{}
+	invariants.SetGroupVersionKind(InvariantGVK.GroupVersion().WithKind("InvariantList"))
+	if err := r.List(ctx, invariants, client.InNamespace(namespace)); err != nil {
+		return nil, err
+	}
+
+	requestByName := map[types.NamespacedName]struct{}{}
+	for i := range invariants.Items {
+		invariant := &invariants.Items[i]
+		derivedViewRef, _, err := unstructured.NestedString(invariant.Object, "spec", "derivedViewRef")
+		if err != nil {
+			return nil, fmt.Errorf("read invariant %s/%s derivedViewRef: %w", invariant.GetNamespace(), invariant.GetName(), err)
+		}
+		if _, ok := derivedViewNames[derivedViewRef]; ok {
+			requestByName[types.NamespacedName{
+				Namespace: invariant.GetNamespace(),
+				Name:      invariant.GetName(),
+			}] = struct{}{}
+		}
+	}
+
+	names := make([]types.NamespacedName, 0, len(requestByName))
+	for name := range requestByName {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		if names[i].Namespace == names[j].Namespace {
+			return names[i].Name < names[j].Name
+		}
+		return names[i].Namespace < names[j].Namespace
+	})
+
+	requests := make([]reconcile.Request, 0, len(names))
+	for _, name := range names {
+		requests = append(requests, reconcile.Request{NamespacedName: name})
+	}
+	return requests, nil
 }
 
 func (r *InvariantReconciler) clock() Clock {

@@ -8,7 +8,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func TestBuildSyntheticInvariantStatusDefaultsHealthy(t *testing.T) {
@@ -214,6 +216,53 @@ func TestResolveCheckerEnvUsesDataSourceAndDerivedViewSecretRefs(t *testing.T) {
 	if envMap["ORDER_EVENTS_TOPIC"].Value != "orders.events.v2" {
 		t.Fatalf("ORDER_EVENTS_TOPIC = %q, want orders.events.v2", envMap["ORDER_EVENTS_TOPIC"].Value)
 	}
+}
+
+func TestInvariantsForDerivedViewEnqueuesOnlyReferencingInvariants(t *testing.T) {
+	indexed := invariantObject("paid-orders-indexed", "existence", nil)
+	freshness := invariantObject("paid-orders-freshness", "freshness", nil)
+	warehouse := invariantObject("warehouse-indexed", "existence", nil)
+	setInvariantDerivedViewRef(warehouse, "warehouse-search-index")
+	derivedView := derivedViewObject("orders-search-index", "orders-postgres", nil)
+
+	reconciler := &InvariantReconciler{
+		Client: fake.NewClientBuilder().
+			WithObjects(indexed, freshness, warehouse, derivedView).
+			Build(),
+	}
+
+	requests := reconciler.invariantsForDerivedView(context.Background(), derivedView)
+
+	assertRequests(t, requests, []types.NamespacedName{
+		{Namespace: "default", Name: "paid-orders-freshness"},
+		{Namespace: "default", Name: "paid-orders-indexed"},
+	})
+}
+
+func TestInvariantsForDataSourceEnqueuesThroughDependentDerivedViews(t *testing.T) {
+	dataSource := dataSourceObject("orders-postgres", "postgres", "orders-postgres-secret", nil)
+	searchView := derivedViewObject("orders-search-index", "orders-postgres", nil)
+	analyticsView := derivedViewObject("orders-analytics-rollup", "orders-postgres", nil)
+	warehouseView := derivedViewObject("warehouse-search-index", "warehouse-postgres", nil)
+
+	indexed := invariantObject("paid-orders-indexed", "existence", nil)
+	aggregate := invariantObject("paid-orders-aggregate", "aggregate", nil)
+	setInvariantDerivedViewRef(aggregate, "orders-analytics-rollup")
+	warehouse := invariantObject("warehouse-indexed", "existence", nil)
+	setInvariantDerivedViewRef(warehouse, "warehouse-search-index")
+
+	reconciler := &InvariantReconciler{
+		Client: fake.NewClientBuilder().
+			WithObjects(dataSource, searchView, analyticsView, warehouseView, indexed, aggregate, warehouse).
+			Build(),
+	}
+
+	requests := reconciler.invariantsForDataSource(context.Background(), dataSource)
+
+	assertRequests(t, requests, []types.NamespacedName{
+		{Namespace: "default", Name: "paid-orders-aggregate"},
+		{Namespace: "default", Name: "paid-orders-indexed"},
+	})
 }
 
 func TestBuildRepairJobUsesReportHandoffConfiguration(t *testing.T) {
@@ -602,6 +651,27 @@ func repairPolicyObject(invariantRef string, approvalRequired bool, actionType s
 	}
 	obj.SetGroupVersionKind(RepairPolicyGVK)
 	return obj
+}
+
+func setInvariantDerivedViewRef(obj *unstructured.Unstructured, derivedViewRef string) {
+	spec := obj.Object["spec"].(map[string]any)
+	spec["derivedViewRef"] = derivedViewRef
+}
+
+func assertRequests(t *testing.T, got []reconcile.Request, want []types.NamespacedName) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d requests (%#v), want %d (%#v)", len(got), got, len(want), want)
+	}
+	requests := map[types.NamespacedName]struct{}{}
+	for _, request := range got {
+		requests[request.NamespacedName] = struct{}{}
+	}
+	for _, name := range want {
+		if _, ok := requests[name]; !ok {
+			t.Fatalf("missing request for %s; got %#v", name.String(), got)
+		}
+	}
 }
 
 func envByName(env []corev1.EnvVar) map[string]corev1.EnvVar {

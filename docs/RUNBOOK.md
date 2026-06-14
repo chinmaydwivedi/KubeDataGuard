@@ -146,7 +146,7 @@ orders-opensearch-secret: url
 orders-kafka-secret: bootstrapServers
 ```
 
-In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`.
+In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`. The operator also watches `DataSource` and `DerivedView` objects, so topology changes enqueue the dependent `Invariant`s; Secret rotation is picked up by the next scheduled check or another reconcile.
 
 Run the operator locally against kind:
 
