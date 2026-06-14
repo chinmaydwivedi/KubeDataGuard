@@ -59,12 +59,27 @@ def producer(settings: Settings) -> KafkaProducer:
 
 
 def publish_event(settings: Settings, event: dict[str, Any]) -> dict[str, Any]:
+    return publish_json(
+        settings,
+        topic=settings.order_events_topic,
+        key=event["order_id"],
+        value=event,
+    )
+
+
+def publish_json(
+    settings: Settings,
+    *,
+    topic: str,
+    key: str,
+    value: dict[str, Any],
+) -> dict[str, Any]:
     client = producer(settings)
     try:
         future = client.send(
-            settings.order_events_topic,
-            key=event["order_id"],
-            value=event,
+            topic,
+            key=key,
+            value=value,
         )
         metadata = future.get(timeout=30)
         client.flush(timeout=30)

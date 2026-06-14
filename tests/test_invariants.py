@@ -1,3 +1,5 @@
+import os
+import json
 import unittest
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -22,6 +24,7 @@ from dataguard.checkpoints import (
 )
 from dataguard.db import execute_source_query_keyset
 from dataguard.local_demo import run_local_proof
+from dataguard.observability import prometheus_metrics
 from dataguard.repair import repair_from_payload
 from dataguard.reporting import write_report_artifacts
 from dataguard.search import execute_target_query
@@ -131,6 +134,44 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(status["reportRef"], "reports/latest.json")
         self.assertIn("checkedAt", status["observationWindow"])
         self.assertIn("maxLagSeconds", status["observationWindow"])
+
+    def test_report_artifacts_include_compact_report_and_apply_retention(self):
+        source = [
+            {
+                "id": "order-1",
+                "status": "paid",
+                "amount_cents": 1200,
+                "currency": "USD",
+                "version": 1,
+            }
+        ]
+        report = compare_paid_orders_to_index(source, {})
+
+        with TemporaryDirectory() as tmpdir:
+            report_dir = Path(tmpdir)
+            old_json = report_dir / "drift-20000101T000000Z.json"
+            old_markdown = report_dir / "drift-20000101T000000Z.md"
+            old_compact = report_dir / "drift-20000101T000000Z.compact.json"
+            old_json.write_text("{}", encoding="utf-8")
+            old_markdown.write_text("# old", encoding="utf-8")
+            old_compact.write_text("{}", encoding="utf-8")
+            for path in [old_json, old_markdown, old_compact]:
+                os.utime(path, (946684800, 946684800))
+            settings = SimpleNamespace(
+                report_dir=report_dir,
+                report_store="local",
+                report_retention_count=1,
+                report_retention_days=30,
+            )
+
+            artifacts = write_report_artifacts(settings, report)
+            compact = json.loads(artifacts.compact_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(artifacts.compact_path.exists())
+            self.assertEqual(compact["status"], "DriftDetected")
+            self.assertFalse(old_json.exists())
+            self.assertFalse(old_markdown.exists())
+            self.assertFalse(old_compact.exists())
 
     def test_stale_when_indexed_document_differs(self):
         source = [
@@ -727,6 +768,73 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(len(events), 2)
         self.assertIn('"action": "reconcile"', events[0])
 
+    def test_repair_from_payload_can_emit_redis_invalidation_requests(self):
+        payload = {"missing": [{"order_id": "order-1"}]}
+
+        with TemporaryDirectory() as tmpdir:
+            settings = SimpleNamespace(report_dir=Path(tmpdir))
+            with patch.dict("os.environ", {"REDIS_KEY_TEMPLATE": "orders:{id}"}):
+                result = repair_from_payload(
+                    settings,
+                    payload,
+                    mode="invalidate-cache",
+                    verbose=False,
+                )
+
+            event_path = Path(result["eventRef"].removeprefix("file://"))
+            event = event_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result["repair_mode"], "invalidate-cache")
+        self.assertIn('"action": "invalidate-cache"', event)
+        self.assertIn('"key": "orders:order-1"', event)
+
+    def test_repair_from_payload_can_emit_clickhouse_backfill_request(self):
+        payload = {"missing": [{"order_id": "order-1"}]}
+
+        with TemporaryDirectory() as tmpdir:
+            settings = SimpleNamespace(report_dir=Path(tmpdir))
+            with patch.dict("os.environ", {"CLICKHOUSE_BACKFILL_TABLE": "orders_rollup"}):
+                result = repair_from_payload(
+                    settings,
+                    payload,
+                    mode="clickhouse-backfill",
+                    verbose=False,
+                )
+
+            request_path = Path(result["backfillRef"].removeprefix("file://"))
+            request_payload = json.loads(request_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["repair_mode"], "clickhouse-backfill")
+        self.assertEqual(result["table"], "orders_rollup")
+        self.assertEqual(request_payload["ids"], ["order-1"])
+
+    def test_repair_from_payload_can_publish_kafka_replay_requests(self):
+        payload = {"missing": [{"order_id": "order-1"}]}
+        settings = SimpleNamespace(order_events_topic="orders.events")
+        fake_events = SimpleNamespace(
+            publish_json=Mock(
+                return_value={
+                    "topic": "orders.reconcile",
+                    "partition": 0,
+                    "offset": 12,
+                }
+            )
+        )
+
+        with patch.dict("sys.modules", {"dataguard.events": fake_events}):
+            with patch.dict("os.environ", {"REPAIR_KAFKA_TOPIC": "orders.reconcile"}):
+                result = repair_from_payload(
+                    settings,
+                    payload,
+                    mode="replay-kafka",
+                    verbose=False,
+                )
+
+        fake_events.publish_json.assert_called_once()
+        self.assertEqual(result["repair_mode"], "replay-kafka")
+        self.assertEqual(result["published"], 1)
+        self.assertEqual(result["topic"], "orders.reconcile")
+
     def test_repair_job_result_marks_failed_when_verification_still_drifts(self):
         verification = compare_paid_orders_to_index(
             [
@@ -758,6 +866,37 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(status["observedGeneration"], 9)
         self.assertEqual(payload["status"], "RepairFailed")
         self.assertEqual(payload["verification"]["status"], "DriftDetected")
+
+    def test_prometheus_metrics_include_drift_and_cdc_frontier_status(self):
+        payload = {
+            "invariant": "paid-orders-indexed",
+            "status": "DriftDetected",
+            "guarantee": "existence+fieldEquality",
+            "healthy": False,
+            "drift_count": 8,
+            "checked_records": 41,
+            "counterexamples": [{"type": "missing"}],
+            "observation_window": {
+                "cdc_frontier": {"status": "bounded"},
+            },
+        }
+
+        metrics = prometheus_metrics(payload)
+
+        self.assertIn("kubedataguard_drift_count", metrics)
+        self.assertIn('invariant="paid-orders-indexed"', metrics)
+        self.assertIn('frontier_status="bounded"', metrics)
+
+    def test_freshness_report_can_use_cache_specific_guarantee(self):
+        report = compare_paid_order_freshness(
+            [],
+            {},
+            invariant_name="paid-orders-redis-cache-freshness",
+            guarantee="cacheFreshness",
+        )
+
+        self.assertEqual(report.invariant, "paid-orders-redis-cache-freshness")
+        self.assertEqual(report.guarantee, "cacheFreshness")
 
     def test_execute_target_query_paginates_past_requested_size(self):
         settings = SimpleNamespace(orders_index="orders")
@@ -1008,8 +1147,9 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
             region_name="us-east-1",
             endpoint_url="http://minio:9000",
         )
-        self.assertEqual(fake_s3.upload_file.call_count, 3)
+        self.assertEqual(fake_s3.upload_file.call_count, 4)
         self.assertTrue(artifacts.report_ref.startswith("s3://kubedataguard-reports/test-run/drift-"))
+        self.assertTrue(artifacts.compact_ref.startswith("s3://kubedataguard-reports/test-run/drift-"))
         self.assertEqual(artifacts.latest_ref, "s3://kubedataguard-reports/test-run/latest.json")
 
     def test_repair_job_result_stays_healthy_when_verification_passes(self):

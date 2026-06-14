@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView watch fan-out to dependent Invariants, a Kubernetes-native demo stack manifest, and a first CDC frontier proof across Postgres WAL/outbox, Kafka offsets, and OpenSearch applied-offset evidence.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView/Secret watch fan-out to dependent Invariants, production-shaped demo StatefulSets, a first CDC frontier proof across Postgres WAL/outbox, Kafka offsets, and target applied-offset evidence, and a second Postgres -> Redis cache freshness derived-view path.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, CDC frontier evidence, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch demo stack, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, compact reports, local retention cleanup, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, CDC frontier evidence, Redis cache freshness checks, Prometheus/OTEL-shaped observability artifacts, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology/Secret-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch/Redis demo stack, and deeper docs.
 
 ## Decisions Made
 
@@ -1292,21 +1292,52 @@ Expected behavior:
 
 ## Next Actions
 
-1. Expand failure taxonomy coverage:
+## Latest Roadmap Completion Pass
+
+Implemented now:
+
+- Replaced demo Deployments with production-shaped StatefulSets for:
+  - Postgres
+  - Redpanda
+  - OpenSearch
+  - Redis
+- Added PVC-backed storage, readiness/liveness probes, resource requests/limits, and stable headless Services.
+- Added repair modes beyond direct reindex:
+  - `emit-reconcile-events`
+  - `replay-kafka`
+  - `call-webhook`
+  - `invalidate-cache`
+  - `clickhouse-backfill`
+- Kept direct reindex fenced behind the unsafe annotation path.
+- Added RepairPolicy action configuration projection into repair Job env.
+- Added Secret rotation fan-out:
+  - DataSource connection Secret changes enqueue dependent Invariants.
+  - DerivedView target/pipeline Secret changes enqueue dependent Invariants.
+- Added Prometheus textfile metrics and OTEL-shaped JSONL span artifacts.
+- Added compact report artifacts.
+- Added local report retention cleanup.
+- Added S3 server-side encryption and retention tagging knobs.
+- Added second source/derived pair:
+  - Postgres source
+  - Redpanda/Kafka pipeline
+  - Redis cache derived view
+  - `redis-freshness` invariant
+  - Redis cache indexer
+  - Redis target applied-offset frontier
+  - Redis cache invalidation repair request mode
+
+## Next Actions
+
+1. Runtime-verify the new StatefulSet/Redis stack end to end in kind.
+2. Expand failure taxonomy coverage:
    - target unavailable
    - checker timeout
    - repair Job crash before report publication
    - repair retry/idempotency
    - stale/corrupt target document
-2. Replace demo Deployments with production-grade stateful installs for Postgres, Redpanda, and OpenSearch.
-3. Add repair strategies beyond source-of-truth reindexing:
-   - Kafka replay
-   - Redis invalidation
-   - ClickHouse aggregate backfill
-4. Add a second source/derived pair to prove the CRD abstraction beyond OpenSearch.
-5. Add Secret rotation fan-out or document that scheduled checks are the refresh boundary.
-6. Add Prometheus/OpenTelemetry metrics and traces for checks, repairs, frontier status, and SLO breaches.
-7. Harden report retention, encryption, lifecycle policy, and compaction.
+3. Add checksum/Merkle narrowing for huge datasets.
+4. Add a real ClickHouse analytics table demo.
+5. Add managed lifecycle policy examples for S3/GCS outside the worker.
 
 ## Open Questions
 
@@ -1320,8 +1351,9 @@ Current answer:
 - `reportRef` now points at the worker report store path for full evidence reports.
 - S3/MinIO-compatible report and checkpoint storage is implemented.
 - Secret-backed DataSource/DerivedView connection resolution is implemented for worker Jobs.
-- DataSource/DerivedView watch fan-out to dependent Invariants is implemented.
-- Next blocking decisions: retention/lifecycle policy, encryption posture, and Secret rotation semantics.
+- DataSource/DerivedView/Secret watch fan-out to dependent Invariants is implemented.
+- Compact reports, local retention, and S3 SSE knobs are implemented.
+- Next blocking decisions: managed object-store lifecycle policies and production database-operator deployment choices.
 
 ### Next Sprint
 
@@ -1336,7 +1368,7 @@ Current answer:
 - Persisted scan checkpoints are implemented for bounded keyset scans.
 - Secret-backed `DataSource` and `DerivedView` resolution is implemented for the job-backed operator.
 - `DataSource` and `DerivedView` topology changes now enqueue affected `Invariant`s.
-- Next: production-grade stateful installs, checksum/Merkle narrowing, and a second source/derived pair.
+- Next: runtime verification of the new Redis/StatefulSet stack, checksum/Merkle narrowing, and ClickHouse analytics backfill.
 
 ### Future
 

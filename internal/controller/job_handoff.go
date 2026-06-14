@@ -36,6 +36,10 @@ const (
 	AnnotationReportBucket          = "dataguard.io/report-bucket"
 	AnnotationReportPrefix          = "dataguard.io/report-prefix"
 	AnnotationReportS3EndpointURL   = "dataguard.io/report-s3-endpoint-url"
+	AnnotationReportRetentionCount  = "dataguard.io/report-retention-count"
+	AnnotationReportRetentionDays   = "dataguard.io/report-retention-days"
+	AnnotationReportS3SSE           = "dataguard.io/report-s3-sse"
+	AnnotationReportS3KMSKeyID      = "dataguard.io/report-s3-kms-key-id"
 	AnnotationAWSRegion             = "dataguard.io/aws-region"
 
 	CheckPartial = "partial"
@@ -57,6 +61,7 @@ const (
 	DefaultPostgresSecretKey     = "dsn"
 	DefaultOpenSearchSecretKey   = "url"
 	DefaultKafkaSecretKey        = "bootstrapServers"
+	DefaultRedisSecretKey        = "url"
 )
 
 type CheckRun struct {
@@ -235,7 +240,7 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 	run CheckRun,
 ) (ctrl.Result, bool, error) {
 	log := ctrl.LoggerFrom(ctx)
-	policy, found, err := r.findAutoRepairPolicy(ctx, invariant)
+	policy, repairMode, found, err := r.findAutoRepairPolicy(ctx, invariant)
 	if err != nil {
 		return ctrl.Result{}, false, err
 	}
@@ -257,7 +262,8 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 		if err != nil {
 			return ctrl.Result{}, true, err
 		}
-		job, err := BuildRepairJobWithEnv(invariant, checkReportConfigMapName, run, env)
+		env = append(env, repairPolicyEnv(policy, repairMode)...)
+		job, err := BuildRepairJobWithEnv(invariant, checkReportConfigMapName, run, env, repairMode)
 		if err != nil {
 			return ctrl.Result{}, true, err
 		}
@@ -272,6 +278,7 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 			"created repair job for invariant",
 			"invariant", req.NamespacedName.String(),
 			"repairPolicy", policy.GetName(),
+			"repairMode", repairMode,
 			"job", jobName,
 			"sourceReportConfigMap", checkReportConfigMapName,
 			"repairConfigMap", repairConfigMapName(invariant, run.ID),
@@ -308,51 +315,53 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 func (r *InvariantReconciler) findAutoRepairPolicy(
 	ctx context.Context,
 	invariant *unstructured.Unstructured,
-) (*unstructured.Unstructured, bool, error) {
+) (*unstructured.Unstructured, string, bool, error) {
 	policies := &unstructured.UnstructuredList{}
 	policies.SetGroupVersionKind(RepairPolicyGVK.GroupVersion().WithKind("RepairPolicyList"))
 	if err := r.List(ctx, policies, client.InNamespace(invariant.GetNamespace())); err != nil {
-		return nil, false, err
+		return nil, "", false, err
 	}
 
 	for index := range policies.Items {
 		policy := &policies.Items[index]
 		invariantRef, _, err := unstructured.NestedString(policy.Object, "spec", "invariantRef")
 		if err != nil {
-			return nil, false, fmt.Errorf("read RepairPolicy %s spec.invariantRef: %w", policy.GetName(), err)
+			return nil, "", false, fmt.Errorf("read RepairPolicy %s spec.invariantRef: %w", policy.GetName(), err)
 		}
 		if invariantRef != invariant.GetName() {
 			continue
 		}
-		allowed, err := repairPolicyAllowsAutoReindex(policy)
+		repairMode, allowed, err := repairPolicyAutoRepairMode(policy)
 		if err != nil {
-			return nil, false, err
+			return nil, "", false, err
 		}
 		if allowed {
-			return policy, true, nil
+			return policy, repairMode, true, nil
 		}
 	}
-	return nil, false, nil
+	return nil, "", false, nil
 }
 
 func repairPolicyAllowsAutoReindex(policy *unstructured.Unstructured) (bool, error) {
+	repairMode, allowed, err := repairPolicyAutoRepairMode(policy)
+	return allowed && repairMode == "direct-reindex", err
+}
+
+func repairPolicyAutoRepairMode(policy *unstructured.Unstructured) (string, bool, error) {
 	approvalRequired, found, err := unstructured.NestedBool(policy.Object, "spec", "approvalRequired")
 	if err != nil {
-		return false, fmt.Errorf("read RepairPolicy %s spec.approvalRequired: %w", policy.GetName(), err)
+		return "", false, fmt.Errorf("read RepairPolicy %s spec.approvalRequired: %w", policy.GetName(), err)
 	}
 	if found && approvalRequired {
-		return false, nil
-	}
-	if policy.GetAnnotations()[AnnotationAllowUnsafeReindex] != "true" {
-		return false, nil
+		return "", false, nil
 	}
 
 	actions, found, err := unstructured.NestedSlice(policy.Object, "spec", "actions")
 	if err != nil {
-		return false, fmt.Errorf("read RepairPolicy %s spec.actions: %w", policy.GetName(), err)
+		return "", false, fmt.Errorf("read RepairPolicy %s spec.actions: %w", policy.GetName(), err)
 	}
 	if !found {
-		return false, nil
+		return "", false, nil
 	}
 	for _, raw := range actions {
 		action, ok := raw.(map[string]any)
@@ -360,11 +369,97 @@ func repairPolicyAllowsAutoReindex(policy *unstructured.Unstructured) (bool, err
 			continue
 		}
 		actionType, _ := action["type"].(string)
-		if actionType == "reindex-records" {
-			return true, nil
+		switch actionType {
+		case "emit-reconcile-events":
+			return "emit-reconcile-events", true, nil
+		case "replay-kafka":
+			return "replay-kafka", true, nil
+		case "call-webhook":
+			return "call-webhook", true, nil
+		case "invalidate-cache":
+			return "invalidate-cache", true, nil
+		case "clickhouse-backfill":
+			return "clickhouse-backfill", true, nil
+		case "reindex-records":
+			if policy.GetAnnotations()[AnnotationAllowUnsafeReindex] == "true" {
+				return "direct-reindex", true, nil
+			}
 		}
 	}
-	return false, nil
+	return "", false, nil
+}
+
+func repairPolicyEnv(policy *unstructured.Unstructured, repairMode string) []corev1.EnvVar {
+	actions, found, err := unstructured.NestedSlice(policy.Object, "spec", "actions")
+	if err != nil || !found {
+		return nil
+	}
+	for _, raw := range actions {
+		action, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		actionType, _ := action["type"].(string)
+		if repairModeForAction(actionType, policy) != repairMode {
+			continue
+		}
+		env := []corev1.EnvVar{}
+		if endpoint, _ := action["endpoint"].(string); endpoint != "" {
+			env = append(env, corev1.EnvVar{Name: "REPAIR_WEBHOOK_URL", Value: endpoint})
+		}
+		if topic, _ := action["topic"].(string); topic != "" {
+			env = append(env, corev1.EnvVar{Name: "REPAIR_KAFKA_TOPIC", Value: topic})
+		}
+		if keyTemplate, _ := action["keyTemplate"].(string); keyTemplate != "" {
+			env = append(env, corev1.EnvVar{Name: "REDIS_KEY_TEMPLATE", Value: keyTemplate})
+		}
+		if table, _ := action["table"].(string); table != "" {
+			env = append(env, corev1.EnvVar{Name: "CLICKHOUSE_BACKFILL_TABLE", Value: table})
+		}
+		if batchSize, ok := numberLikeString(action["batchSize"]); ok {
+			env = append(env, corev1.EnvVar{Name: "REPAIR_WEBHOOK_BATCH_SIZE", Value: batchSize})
+		}
+		return env
+	}
+	return nil
+}
+
+func repairModeForAction(actionType string, policy *unstructured.Unstructured) string {
+	switch actionType {
+	case "emit-reconcile-events":
+		return "emit-reconcile-events"
+	case "replay-kafka":
+		return "replay-kafka"
+	case "call-webhook":
+		return "call-webhook"
+	case "invalidate-cache":
+		return "invalidate-cache"
+	case "clickhouse-backfill":
+		return "clickhouse-backfill"
+	case "reindex-records":
+		if policy.GetAnnotations()[AnnotationAllowUnsafeReindex] == "true" {
+			return "direct-reindex"
+		}
+	}
+	return ""
+}
+
+func numberLikeString(value any) (string, bool) {
+	switch typed := value.(type) {
+	case int:
+		return strconv.Itoa(typed), true
+	case int64:
+		return strconv.FormatInt(typed, 10), true
+	case float64:
+		return strconv.FormatInt(int64(typed), 10), true
+	case string:
+		if typed == "" {
+			return "", false
+		}
+		return typed, true
+	default:
+		return "", false
+	}
 }
 
 func BuildCheckerJob(invariant *unstructured.Unstructured, run CheckRun) (*batchv1.Job, error) {
@@ -431,7 +526,7 @@ func BuildCheckerJobWithEnv(
 }
 
 func BuildRepairJob(invariant *unstructured.Unstructured, sourceReportConfigMapName string, run CheckRun) (*batchv1.Job, error) {
-	return BuildRepairJobWithEnv(invariant, sourceReportConfigMapName, run, checkerEnv(invariant))
+	return BuildRepairJobWithEnv(invariant, sourceReportConfigMapName, run, checkerEnv(invariant), "direct-reindex")
 }
 
 func BuildRepairJobWithEnv(
@@ -439,6 +534,7 @@ func BuildRepairJobWithEnv(
 	sourceReportConfigMapName string,
 	run CheckRun,
 	env []corev1.EnvVar,
+	repairMode string,
 ) (*batchv1.Job, error) {
 	maxLagSeconds, err := maxLagSeconds(invariant)
 	if err != nil {
@@ -458,7 +554,7 @@ func BuildRepairJobWithEnv(
 		"--invariant-name", invariant.GetName(),
 		"--observed-generation", strconv.FormatInt(invariant.GetGeneration(), 10),
 		"--check-id", run.ID,
-		"--repair-mode", "direct-reindex",
+		"--repair-mode", repairMode,
 		"--max-lag-seconds", strconv.FormatInt(maxLagSeconds, 10),
 		"--verify-invariant", checkerInvariantArg(invariant),
 	}
@@ -801,8 +897,15 @@ func applyDerivedViewEnv(env []corev1.EnvVar, derivedView *unstructured.Unstruct
 		secretKey := nestedStringOrDefault(derivedView, DefaultOpenSearchSecretKey, "spec", "target", "connectionSecretKey")
 		env = upsertEnvVar(env, secretEnvVar("OPENSEARCH_URL", targetSecret, secretKey))
 	}
+	if targetType == "redis" && targetSecret != "" {
+		secretKey := nestedStringOrDefault(derivedView, DefaultRedisSecretKey, "spec", "target", "connectionSecretKey")
+		env = upsertEnvVar(env, secretEnvVar("REDIS_URL", targetSecret, secretKey))
+	}
 	if index, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "index"); index != "" {
 		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDERS_INDEX", Value: index})
+	}
+	if keyPrefix, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "keyPrefix"); keyPrefix != "" {
+		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDER_CACHE_PREFIX", Value: keyPrefix})
 	}
 	if topic, _, _ := unstructured.NestedString(derivedView.Object, "spec", "pipeline", "topic"); topic != "" {
 		env = upsertEnvVar(env, corev1.EnvVar{Name: "ORDER_EVENTS_TOPIC", Value: topic})
@@ -853,11 +956,17 @@ func checkerEnv(invariant *unstructured.Unstructured) []corev1.EnvVar {
 		{Name: "ORDER_EVENTS_TOPIC", Value: annotationOrDefault(invariant, AnnotationOrderEventsTopic, streamTopic(invariant))},
 		{Name: "OPENSEARCH_URL", Value: annotationOrDefault(invariant, AnnotationOpenSearchURL, DefaultOpenSearchURL)},
 		{Name: "ORDERS_INDEX", Value: annotationOrDefault(invariant, AnnotationOrdersIndex, DefaultOrdersIndex)},
+		{Name: "REDIS_URL", Value: annotationOrDefault(invariant, "dataguard.io/redis-url", "redis://host.docker.internal:6379/0")},
+		{Name: "ORDER_CACHE_PREFIX", Value: annotationOrDefault(invariant, "dataguard.io/order-cache-prefix", "order")},
 		{Name: "REPORT_DIR", Value: DefaultReportDir},
 		{Name: "REPORT_STORE", Value: annotationOrDefault(invariant, AnnotationReportStore, DefaultReportStore)},
 		{Name: "REPORT_BUCKET", Value: annotationOrDefault(invariant, AnnotationReportBucket, "")},
 		{Name: "REPORT_PREFIX", Value: annotationOrDefault(invariant, AnnotationReportPrefix, DefaultReportPrefix)},
 		{Name: "REPORT_S3_ENDPOINT_URL", Value: annotationOrDefault(invariant, AnnotationReportS3EndpointURL, "")},
+		{Name: "REPORT_RETENTION_COUNT", Value: annotationOrDefault(invariant, AnnotationReportRetentionCount, "25")},
+		{Name: "REPORT_RETENTION_DAYS", Value: annotationOrDefault(invariant, AnnotationReportRetentionDays, "30")},
+		{Name: "REPORT_S3_SSE", Value: annotationOrDefault(invariant, AnnotationReportS3SSE, "")},
+		{Name: "REPORT_S3_KMS_KEY_ID", Value: annotationOrDefault(invariant, AnnotationReportS3KMSKeyID, "")},
 		{Name: "AWS_REGION", Value: annotationOrDefault(invariant, AnnotationAWSRegion, DefaultAWSRegion)},
 	}
 }
@@ -870,6 +979,8 @@ func checkerInvariantArg(invariant *unstructured.Unstructured) string {
 		return "aggregate"
 	case "freshness":
 		return "freshness"
+	case "redis-freshness":
+		return "redis-freshness"
 	default:
 		return "existence"
 	}

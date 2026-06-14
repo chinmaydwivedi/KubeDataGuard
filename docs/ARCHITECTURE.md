@@ -6,20 +6,22 @@ The MVP protects one derived view:
 
 ```text
 Postgres orders table -> Redpanda orders.events topic -> OpenSearch orders index
+Postgres orders table -> Redpanda orders.events topic -> Redis order cache
 ```
 
 There are now three execution modes:
 
 - `demo-local`: deterministic no-Docker proof that models Postgres source rows and OpenSearch documents in memory.
-- Compose demo: real Postgres, Redpanda, and OpenSearch integration.
-- Kubernetes job-backed demo: kind runs Postgres, Redpanda, OpenSearch, the Go operator, and scheduled Python checker/repair Jobs in-cluster.
+- Compose demo: real Postgres, Redpanda, OpenSearch, and Redis integration.
+- Kubernetes job-backed demo: kind runs Postgres, Redpanda, OpenSearch, Redis, the Go operator, and scheduled Python checker/repair Jobs in-cluster.
 
 All three modes use the same invariant/report semantics. The local proof is not the final runtime target; it is a fast, dependency-light way to prove the control loop.
 
-The declared consistency SLO:
+The declared consistency SLOs:
 
 ```text
 Every paid order committed in Postgres must appear in the OpenSearch orders index after the allowed lag window.
+Every paid order committed in Postgres must be reflected in the Redis cache after the allowed lag window.
 ```
 
 ## Why This Is The Right First Slice
@@ -29,6 +31,7 @@ This slice contains the core DDIA problem without drowning in infrastructure:
 - Postgres is the system of record.
 - Redpanda/Kafka is the replication log.
 - OpenSearch is derived data for search.
+- Redis is derived data for low-latency cache reads.
 - The indexer is the asynchronous pipeline.
 - The checker measures whether the derived view is trustworthy.
 - The repair command rebuilds missing or stale records from the source of truth.
@@ -80,11 +83,11 @@ This is the difference between a casual diff and an SLO check. A record updated 
 
 ### Invariant Layers
 
-The first three invariant layers are intentionally complementary:
+The first invariant layers are intentionally complementary:
 
 - Existence and field equality catch missing or stale individual records.
 - Aggregate consistency catches count and revenue mismatches that might be visible in analytics or dashboards.
-- Bounded freshness catches source updates that the derived view has not observed within the declared lag window.
+- Bounded freshness catches source updates that OpenSearch or Redis has not observed within the declared lag window.
 
 This mirrors real systems: user-facing search may need record-level correctness, business dashboards often need aggregate correctness, and replicated read paths need freshness evidence.
 
@@ -289,9 +292,9 @@ The local commands map directly to operator reconciliation:
 
 ```text
 DataSource    -> Postgres connection
-DerivedView   -> OpenSearch index derived through Redpanda
-Invariant     -> paid-orders-indexed rule
-RepairPolicy  -> emit reconciliation requests or explicitly approved repair
+DerivedView   -> OpenSearch index or Redis cache derived through Redpanda
+Invariant     -> paid-orders-indexed, paid-orders-freshness, paid-orders-redis-cache-freshness
+RepairPolicy  -> emit reconciliation, Kafka replay, webhook, cache invalidation, ClickHouse backfill, or explicitly approved direct repair
 ```
 
 The controller loop now performs the first closed-loop version of what the CLI proved:
@@ -304,7 +307,7 @@ trigger reconciliation if policy allows
 verify
 ```
 
-The first direct repair strategy is implemented for `reindex-records`, but automatic direct writes are unsafe by default. The safer worker path can emit reconciliation-event JSONL, and later integrations should publish those events to Kafka/webhooks, invalidate Redis, or trigger analytics backfill.
+The first direct repair strategy is implemented for `reindex-records`, but automatic direct writes are unsafe by default. The safer worker path can emit reconciliation-event JSONL, publish Kafka replay requests, call owner webhooks, emit Redis invalidation requests, or emit ClickHouse backfill requests.
 
 ## Current Closed-Loop Operator
 
@@ -347,6 +350,7 @@ Invariant.spec.derivedViewRef
 
 DerivedView.spec.target.connectionSecret
   -> worker OPENSEARCH_URL secretKeyRef
+  -> or worker REDIS_URL secretKeyRef
 
 DerivedView.spec.pipeline.connectionSecret
   -> worker KAFKA_BOOTSTRAP_SERVERS secretKeyRef
@@ -354,7 +358,7 @@ DerivedView.spec.pipeline.connectionSecret
 
 The operator injects `valueFrom.secretKeyRef` into the checker and repair Jobs. It does not copy credential values into CRD status, ConfigMaps, or annotations. Annotation/default connection values still exist as a local-development fallback, but the CRD path is now the primary Kubernetes path.
 
-`DataSource` and `DerivedView` are watched topology resources. A `DerivedView` change enqueues the `Invariant`s that reference it. A `DataSource` change first finds derived views with that `sourceRef`, then enqueues the invariants attached to those derived views. Secret changes are not watched yet; the current refresh boundary for rotated credentials is the next scheduled check or another topology/invariant reconcile.
+`DataSource`, `DerivedView`, and referenced Secrets are watched topology resources. A `DerivedView` change enqueues the `Invariant`s that reference it. A `DataSource` change first finds derived views with that `sourceRef`, then enqueues the invariants attached to those derived views. A Secret change now fans out through matching DataSource and DerivedView references, so rotated credentials trigger fresh checker Jobs instead of waiting for the next interval.
 
 Scheduled invariants use `spec.checkIntervalSeconds`. The controller computes a `checkID` from the invariant generation and the current interval slot. That gives repeated checks without duplicate Jobs inside the same interval.
 

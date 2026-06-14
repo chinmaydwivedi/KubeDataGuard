@@ -17,6 +17,14 @@ stringData:
 apiVersion: v1
 kind: Secret
 metadata:
+  name: orders-redis-secret
+type: Opaque
+stringData:
+  url: redis://dataguard-redis:6379/0
+---
+apiVersion: v1
+kind: Secret
+metadata:
   name: orders-kafka-secret
 type: Opaque
 stringData:
@@ -115,6 +123,50 @@ spec:
   actions:
     - type: emit-reconcile-events
       batchSize: 500
+---
+apiVersion: dataguard.io/v1alpha1
+kind: DerivedView
+metadata:
+  name: orders-redis-cache
+spec:
+  sourceRef: orders-postgres
+  target:
+    type: redis
+    connectionSecret: orders-redis-secret
+    keyPrefix: order
+  pipeline:
+    type: kafka
+    connectionSecret: orders-kafka-secret
+    topic: orders.events
+---
+apiVersion: dataguard.io/v1alpha1
+kind: Invariant
+metadata:
+  name: paid-orders-redis-cache-freshness
+  annotations:
+    dataguard.io/checker-mode: job
+    dataguard.io/checker-image: kubedataguard-dataguard:latest
+spec:
+  derivedViewRef: orders-redis-cache
+  type: redis-freshness
+  checkIntervalSeconds: 300
+  maxLagSeconds: 60
+  severity: warning
+  sourceQuery: |
+    select id, updated_at from orders where status = 'paid'
+  targetQuery: |
+    Redis key order:{id} must exist and have cached_at >= source updated_at
+---
+apiVersion: dataguard.io/v1alpha1
+kind: RepairPolicy
+metadata:
+  name: invalidate-stale-paid-order-cache
+spec:
+  invariantRef: paid-orders-redis-cache-freshness
+  approvalRequired: true
+  actions:
+    - type: invalidate-cache
+      keyTemplate: order:{id}
 ---
 apiVersion: dataguard.io/v1alpha1
 kind: Invariant

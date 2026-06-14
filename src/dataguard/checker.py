@@ -125,6 +125,45 @@ def check_paid_orders_freshness(
     )
 
 
+def check_paid_orders_redis_freshness(
+    settings: Settings,
+    *,
+    max_lag_seconds: int,
+) -> DriftReport:
+    from . import cache
+
+    checked_at = datetime.now(timezone.utc)
+    offsets = stream_offsets(settings)
+    source_orders = db.fetch_paid_orders(settings, max_lag_seconds=max_lag_seconds)
+    source_lsn = source_lsn_or_none(settings)
+    cached_orders = cache.mget_orders(settings, [order["id"] for order in source_orders])
+    target_read_at = datetime.now(timezone.utc)
+    cdc_frontier = build_check_cdc_frontier(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        source_lsn=source_lsn,
+        source_watermark=latest_source_watermark(source_orders),
+        offsets=offsets,
+        target_read_at=target_read_at,
+        target_frontier=cache.target_offset_frontier(settings),
+    )
+    report = compare_paid_order_freshness(
+        source_orders,
+        cached_orders,
+        invariant_name="paid-orders-redis-cache-freshness",
+        guarantee="cacheFreshness",
+        max_lag_seconds=max_lag_seconds,
+        checked_at=checked_at,
+        target_read_at=target_read_at,
+        stream_topic=settings.order_events_topic,
+        stream_offset_start=offsets["stream_offset_start"],
+        stream_offset_end=offsets["stream_offset_end"],
+        source_lsn=source_lsn,
+        cdc_frontier=cdc_frontier,
+    )
+    return report
+
+
 def check_query_invariant(
     settings: Settings,
     *,
@@ -292,6 +331,7 @@ def build_check_cdc_frontier(
     source_watermark: str | None,
     offsets: dict[str, Any],
     target_read_at: datetime,
+    target_frontier: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         outbox = db.outbox_frontier(settings, max_lag_seconds=max_lag_seconds)
@@ -301,14 +341,15 @@ def build_check_cdc_frontier(
             "available": False,
             "error": str(exc),
         }
-    try:
-        target_frontier = search.target_offset_frontier(settings)
-    except Exception as exc:
-        target_frontier = {
-            "system": "opensearch",
-            "available": False,
-            "error": str(exc),
-        }
+    if target_frontier is None:
+        try:
+            target_frontier = search.target_offset_frontier(settings)
+        except Exception as exc:
+            target_frontier = {
+                "system": "opensearch",
+                "available": False,
+                "error": str(exc),
+            }
     return build_cdc_frontier(
         source_lsn=source_lsn,
         source_watermark=source_watermark,

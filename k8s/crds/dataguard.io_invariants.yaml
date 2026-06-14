@@ -44,7 +44,7 @@ spec:
                   type: string
                 type:
                   type: string
-                  enum: ["existence", "fieldEquality", "count", "checksum", "freshness", "aggregate", "query"]
+                  enum: ["existence", "fieldEquality", "count", "checksum", "freshness", "redis-freshness", "aggregate", "query"]
                 checkIntervalSeconds:
                   type: integer
                   minimum: 0

@@ -129,7 +129,7 @@ That target performs the full vertical slice:
 ```text
 create or reuse the kind cluster
 build and load the checker and operator images
-apply Postgres, Redpanda, and OpenSearch demo deployments
+apply Postgres, Redpanda, OpenSearch, and Redis demo StatefulSets
 seed 50 orders from an in-cluster data worker pod
 consume Kafka events with deliberate OpenSearch drift
 apply CRDs, example resources, and the operator deployment
@@ -157,11 +157,12 @@ The native demo stack exposes these in-cluster Services:
 dataguard-postgres:5432
 dataguard-redpanda:9092
 dataguard-opensearch:9200
+dataguard-redis:6379
 ```
 
-The example resources include demo Kubernetes Secrets for those Services: `orders-postgres-secret/dsn`, `orders-opensearch-secret/url`, and `orders-kafka-secret/bootstrapServers`.
+The example resources include demo Kubernetes Secrets for those Services: `orders-postgres-secret/dsn`, `orders-opensearch-secret/url`, `orders-redis-secret/url`, and `orders-kafka-secret/bootstrapServers`.
 
-In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`. The operator also watches `DataSource` and `DerivedView` objects, so topology changes enqueue the dependent `Invariant`s; Secret rotation is picked up by the next scheduled check or another reconcile.
+In job-backed mode, the operator resolves `Invariant -> DerivedView -> DataSource` and injects those keys into the checker/repair Job environment with `valueFrom.secretKeyRef`. The operator also watches `DataSource`, `DerivedView`, and referenced Secret objects, so topology changes and credential rotation enqueue the dependent `Invariant`s.
 
 The example invariants already opt into job-backed mode:
 
@@ -506,6 +507,9 @@ Reports are not only pass/fail output. Key fields:
 - `observation_window.stream_offset_start` and `stream_offset_end`: the event range associated with the check when available
 - `observation_window.cdc_frontier`: the first bounded-window proof chain, including Postgres WAL LSN, outbox publish counts, Kafka per-partition offsets, target applied offsets, and a `bounded`, `partial`, or `unavailable` status
 - `observation_window.source_scan`: keyset scan evidence for query invariants, including page size, pages read, rows read, first key, last key, resume key, query hash, checkpoint ref, and loaded checkpoint summary
+- `*.compact.json`: compact report summaries for dashboards and indexing
+- `*.prom`: Prometheus textfile metrics emitted beside report artifacts
+- `*.otel.jsonl`: OTEL-shaped span events emitted beside report artifacts
 - `counterexamples`: short proof objects for missing, stale, or aggregate drift
 - `missing`, `stale`, `aggregate_mismatches`, `freshness_violations`: detailed current drift classes
 - `freshness_breaches`: historical freshness SLO misses preserved for evidence after current repair convergence

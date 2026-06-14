@@ -11,6 +11,7 @@ This repository is a research prototype vertical-slice MVP, not a production-rea
 What is implemented and verified:
 
 - Postgres -> Redpanda/Kafka -> OpenSearch demo pipeline.
+- Second derived-view path: Postgres -> Redpanda/Kafka -> Redis cache freshness.
 - Hardcoded commerce invariants for existence, aggregate consistency, and bounded freshness.
 - A first generic query invariant for Postgres source queries and OpenSearch JSON target queries.
 - Keyset-paginated Postgres source scans for query invariants, with source scan evidence in reports.
@@ -18,22 +19,25 @@ What is implemented and verified:
 - OpenSearch target query pagination with `search_after`; `size` is treated as page size, not a correctness cap.
 - First CDC frontier proof for the commerce path: Postgres WAL LSN, outbox publication state, Kafka partition offsets, and OpenSearch applied-offset evidence are recorded in the observation window.
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
-- A Kubernetes-native kind demo stack for Postgres, Redpanda, OpenSearch, checker Jobs, and the operator.
+- A Kubernetes-native kind demo stack for Postgres, Redpanda, OpenSearch, Redis, checker Jobs, and the operator.
+- Production-shaped demo StatefulSets with PVCs, probes, and resource bounds for Postgres, Redpanda, OpenSearch, and Redis.
 - Compact Kubernetes status handoff through ConfigMaps.
 - Full JSON/Markdown reports written to the worker report store and referenced from status.
 - Optional S3/MinIO-compatible durable report publication with `s3://...` status refs.
 - Kubernetes Secret-backed connection env resolution through `DataSource` and `DerivedView` resources.
-- `DataSource` and `DerivedView` watch fan-out to dependent `Invariant` reconciles.
+- `DataSource`, `DerivedView`, and Secret rotation watch fan-out to dependent `Invariant` reconciles.
 - Direct source-of-truth reindex repair for explicit local demos.
-- Safer reconciliation-event repair mode for owner-executed remediation.
+- Safer owner-executed repair modes: reconciliation JSONL, Kafka replay requests, webhook dispatch, Redis invalidation requests, and ClickHouse backfill requests.
+- Prometheus textfile metrics and OTEL-shaped JSONL span artifacts for check/repair reports.
+- Compact report artifacts, local retention cleanup, and optional S3 server-side encryption metadata.
 - Operator safeguards that avoid status churn for repeated healthy scheduled checks.
 
 What is intentionally not solved yet:
 
-- Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
+- Arbitrary databases and target stores beyond the current Postgres/OpenSearch and Redis-cache paths.
 - Full DBLog-style logical decoding, exact snapshot-plus-log recovery, and crash-exact scan recovery.
-- Object-store lifecycle policy, retention, encryption, and report compaction.
-- Production repair integrations such as Kafka replay, webhook dispatch, cache invalidation, and analytics backfill.
+- Managed object-store lifecycle policies outside KubeDataGuard's own upload metadata.
+- Fully managed production operators for databases; the checked-in stack is production-shaped, not a replacement for CloudNativePG, Redpanda Operator, or OpenSearch Operator.
 
 ## Architectural Boundary
 
@@ -113,10 +117,12 @@ The first demo should run in a few commands:
 
 ```sh
 make demo-local # no-Docker proof: drift -> report -> repair -> clean verification
-make up       # starts Postgres, Redpanda, Redpanda Console, and OpenSearch
+make up       # starts Postgres, Redpanda, Redpanda Console, OpenSearch, and Redis
 make seed     # resets the demo and inserts 50 orders, most marked paid
 make drift    # commits some paid events without indexing them
+make drift-cache # commits some paid events without updating Redis
 make check    # reports missing paid orders with order IDs and source details
+make check-redis-freshness # checks the Postgres -> Redis cache freshness invariant
 make repair   # reindexes missing/stale orders from Postgres and verifies
 make check    # produces a clean report
 make demo-freshness-drift # proves bounded-freshness drift with source/target timestamps
@@ -792,6 +798,7 @@ Expected behavior:
 - Implemented bounded freshness checks using source `updated_at`, target `indexed_at`, Postgres LSN, Kafka offset evidence, and target applied-offset evidence
 - Implemented freshness drift injection and freshness repair verification
 - Implemented first generic Postgres/OpenSearch query invariant path
+- Implemented Postgres -> Redis cache freshness as the second source/derived pair
 - Implemented persisted checkpoint state for bounded source scans
 - Keep existence as the simplest invariant
 
@@ -807,8 +814,9 @@ Expected behavior:
 
 ### Milestone 5: Second Source/Derived Pair
 
-- Add Postgres -> Redis cache freshness, or Postgres -> ClickHouse aggregate table
-- Prove the CRD abstraction is not tailored only to OpenSearch
+- Implemented Postgres -> Redis cache freshness
+- Added Redis cache indexer, Redis derived view CRD example, Redis Secret env resolution, Redis frontier evidence, and cache invalidation repair requests
+- Next: ClickHouse aggregate backfill as the first analytics derived-view path
 
 ### Milestone 6: Operator Shape
 
@@ -821,18 +829,23 @@ Expected behavior:
 - Implemented repair Job creation from explicitly allowed `RepairPolicy`
 - Implemented repair result ConfigMap handoff and verified status update
 - Added operator Dockerfile and in-cluster Deployment/RBAC sketch
-- Added Kubernetes-native demo stack for Postgres, Redpanda, and OpenSearch
+- Added Kubernetes-native demo stack for Postgres, Redpanda, OpenSearch, and Redis
+- Converted demo data systems to StatefulSets with PVCs, probes, and resource requests/limits
+- Added Secret rotation fan-out to dependent Invariants
 - Enabled CRD `status` subresource
 - Update `.status` on `Invariant`
 - Run on kind/minikube
 
 ### Milestone 7: Observability
 
-- Prometheus metrics:
-  - `dataguard_invariant_healthy`
-  - `dataguard_drift_records`
-  - `dataguard_repair_attempts_total`
-  - `dataguard_repair_success_total`
+- Implemented Prometheus textfile metrics:
+  - `kubedataguard_drift_count`
+  - `kubedataguard_checked_records`
+  - `kubedataguard_counterexample_count`
+  - `kubedataguard_slo_breach_count`
+  - `kubedataguard_check_healthy`
+  - `kubedataguard_cdc_frontier_status`
+- Implemented OTEL-shaped JSONL span artifacts for check reports
 - OpenTelemetry traces around check and repair cycles
 - Grafana dashboard
 

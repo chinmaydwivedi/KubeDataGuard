@@ -454,6 +454,8 @@ def compare_paid_order_freshness(
     source_orders: list[dict[str, Any]],
     indexed_orders: dict[str, dict[str, Any]],
     *,
+    invariant_name: str = "paid-orders-freshness",
+    guarantee: str = "boundedFreshness",
     max_lag_seconds: int = 60,
     checked_at: datetime | None = None,
     target_read_at: datetime | None = None,
@@ -531,11 +533,11 @@ def compare_paid_order_freshness(
             )
 
     return DriftReport(
-        invariant="paid-orders-freshness",
+        invariant=invariant_name,
         checked_records=len(source_orders),
         freshness_violations=freshness_violations,
         freshness_breaches=freshness_breaches,
-        guarantee="boundedFreshness",
+        guarantee=guarantee,
         observation_window=build_observation_window(
             source_orders,
             max_lag_seconds=max_lag_seconds,

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,34 +14,40 @@ from .invariants import DriftReport
 class ReportArtifacts:
     json_path: Path
     markdown_path: Path
+    compact_path: Path
     latest_path: Path
     report_ref: str
     markdown_ref: str
+    compact_ref: str
     latest_ref: str
 
 
-def write_reports(report_dir: Path, report: DriftReport) -> tuple[Path, Path]:
+def write_reports(report_dir: Path, report: DriftReport) -> tuple[Path, Path, Path, Path]:
     report_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     json_path = report_dir / f"drift-{stamp}.json"
     markdown_path = report_dir / f"drift-{stamp}.md"
+    compact_path = report_dir / f"drift-{stamp}.compact.json"
     payload = report.to_dict()
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     markdown_path.write_text(markdown_report(payload), encoding="utf-8")
+    compact_path.write_text(json.dumps(compact_report(payload), indent=2, sort_keys=True), encoding="utf-8")
     latest_path = report_dir / "latest.json"
     latest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-    return json_path, markdown_path
+    return json_path, markdown_path, compact_path, latest_path
 
 
 def write_report_artifacts(settings: Settings, report: DriftReport) -> ReportArtifacts:
-    json_path, markdown_path = write_reports(settings.report_dir, report)
-    latest_path = settings.report_dir / "latest.json"
+    json_path, markdown_path, compact_path, latest_path = write_reports(settings.report_dir, report)
+    apply_local_retention(settings)
     local = ReportArtifacts(
         json_path=json_path,
         markdown_path=markdown_path,
+        compact_path=compact_path,
         latest_path=latest_path,
         report_ref=file_ref(json_path),
         markdown_ref=file_ref(markdown_path),
+        compact_ref=file_ref(compact_path),
         latest_ref=file_ref(latest_path),
     )
     if report_store(settings) == "local":
@@ -67,6 +73,7 @@ def publish_s3_artifacts(settings: Settings, artifacts: ReportArtifacts) -> Repo
     uploads = [
         (artifacts.json_path, s3_key(settings, artifacts.json_path), "application/json"),
         (artifacts.markdown_path, s3_key(settings, artifacts.markdown_path), "text/markdown"),
+        (artifacts.compact_path, s3_key(settings, artifacts.compact_path), "application/json"),
         (artifacts.latest_path, s3_key(settings, artifacts.latest_path), "application/json"),
     ]
     for path, key, content_type in uploads:
@@ -74,16 +81,18 @@ def publish_s3_artifacts(settings: Settings, artifacts: ReportArtifacts) -> Repo
             str(path),
             settings.report_bucket,
             key,
-            ExtraArgs={"ContentType": content_type},
+            ExtraArgs=s3_extra_args(settings, content_type),
         )
 
     return ReportArtifacts(
         json_path=artifacts.json_path,
         markdown_path=artifacts.markdown_path,
+        compact_path=artifacts.compact_path,
         latest_path=artifacts.latest_path,
         report_ref=s3_ref(settings.report_bucket, uploads[0][1]),
         markdown_ref=s3_ref(settings.report_bucket, uploads[1][1]),
-        latest_ref=s3_ref(settings.report_bucket, uploads[2][1]),
+        compact_ref=s3_ref(settings.report_bucket, uploads[2][1]),
+        latest_ref=s3_ref(settings.report_bucket, uploads[3][1]),
     )
 
 
@@ -105,6 +114,78 @@ def s3_key(settings: Settings, path: Path) -> str:
 
 def s3_ref(bucket: str, key: str) -> str:
     return f"s3://{bucket}/{key}"
+
+
+def s3_extra_args(settings: Settings, content_type: str) -> dict[str, str]:
+    extra_args = {"ContentType": content_type}
+    report_s3_sse = getattr(settings, "report_s3_sse", "")
+    report_s3_kms_key_id = getattr(settings, "report_s3_kms_key_id", "")
+    report_retention_days = int(getattr(settings, "report_retention_days", 0) or 0)
+    if report_s3_sse:
+        extra_args["ServerSideEncryption"] = report_s3_sse
+    if report_s3_sse == "aws:kms" and report_s3_kms_key_id:
+        extra_args["SSEKMSKeyId"] = report_s3_kms_key_id
+    if report_retention_days > 0:
+        extra_args["Tagging"] = f"retentionDays={report_retention_days}"
+    return extra_args
+
+
+def compact_report(payload: dict[str, Any]) -> dict[str, Any]:
+    window = payload.get("observation_window") or {}
+    frontier = window.get("cdc_frontier") or {}
+    return {
+        "invariant": payload.get("invariant"),
+        "status": payload.get("status"),
+        "healthy": payload.get("healthy"),
+        "guarantee": payload.get("guarantee"),
+        "check_status": payload.get("check_status"),
+        "checked_records": payload.get("checked_records"),
+        "drift_count": payload.get("drift_count"),
+        "counterexample_count": len(payload.get("counterexamples") or []),
+        "freshness_breach_count": len(payload.get("freshness_breaches") or []),
+        "checked_at": window.get("checked_at"),
+        "target_read_at": window.get("target_read_at"),
+        "source_watermark": window.get("source_watermark"),
+        "source_lsn": window.get("source_lsn"),
+        "cdc_frontier_status": frontier.get("status"),
+        "cdc_frontier_reason": frontier.get("reason"),
+        "kubernetes_status": payload.get("kubernetes_status"),
+    }
+
+
+def apply_local_retention(settings: Settings) -> None:
+    report_dir = settings.report_dir
+    if not report_dir.exists():
+        return
+    report_count = max(0, int(getattr(settings, "report_retention_count", 0)))
+    retention_days = max(0, int(getattr(settings, "report_retention_days", 0)))
+    cutoff = None
+    if retention_days:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+
+    reports = sorted(
+        [
+            path
+            for path in report_dir.glob("drift-*.json")
+            if not path.name.endswith(".compact.json")
+        ],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for index, path in enumerate(reports):
+        modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        too_many = report_count > 0 and index >= report_count
+        too_old = cutoff is not None and modified < cutoff
+        if too_many or too_old:
+            delete_report_family(path)
+
+
+def delete_report_family(json_path: Path) -> None:
+    prefix = json_path.name.removesuffix(".json")
+    for suffix in [".json", ".md", ".compact.json"]:
+        candidate = json_path.with_name(f"{prefix}{suffix}")
+        if candidate.exists():
+            candidate.unlink()
 
 
 def markdown_report(payload: dict[str, Any]) -> str:

@@ -44,6 +44,8 @@ spec:
                       type: string
                     table:
                       type: string
+                    keyPrefix:
+                      type: string
                 pipeline:
                   type: object
                   properties:

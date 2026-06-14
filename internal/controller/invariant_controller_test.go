@@ -218,6 +218,40 @@ func TestResolveCheckerEnvUsesDataSourceAndDerivedViewSecretRefs(t *testing.T) {
 	}
 }
 
+func TestResolveCheckerEnvUsesRedisDerivedViewSecretRefs(t *testing.T) {
+	invariant := invariantObject("paid-orders-redis-cache-freshness", "redis-freshness", nil)
+	setInvariantDerivedViewRef(invariant, "orders-redis-cache")
+	dataSource := dataSourceObject("orders-postgres", "postgres", "orders-postgres-secret", nil)
+	derivedView := derivedViewObject(
+		"orders-redis-cache",
+		"orders-postgres",
+		map[string]any{
+			"target": map[string]any{
+				"type":                "redis",
+				"connectionSecret":    "orders-redis-secret",
+				"connectionSecretKey": "url",
+				"keyPrefix":           "order-cache",
+			},
+		},
+	)
+	reconciler := &InvariantReconciler{
+		Client: fake.NewClientBuilder().
+			WithObjects(invariant, dataSource, derivedView).
+			Build(),
+	}
+
+	env, err := reconciler.resolveCheckerEnv(context.Background(), invariant)
+	if err != nil {
+		t.Fatalf("resolveCheckerEnv returned error: %v", err)
+	}
+
+	envMap := envByName(env)
+	assertSecretEnv(t, envMap["REDIS_URL"], "orders-redis-secret", "url")
+	if envMap["ORDER_CACHE_PREFIX"].Value != "order-cache" {
+		t.Fatalf("ORDER_CACHE_PREFIX = %q, want order-cache", envMap["ORDER_CACHE_PREFIX"].Value)
+	}
+}
+
 func TestInvariantsForDerivedViewEnqueuesOnlyReferencingInvariants(t *testing.T) {
 	indexed := invariantObject("paid-orders-indexed", "existence", nil)
 	freshness := invariantObject("paid-orders-freshness", "freshness", nil)
@@ -263,6 +297,50 @@ func TestInvariantsForDataSourceEnqueuesThroughDependentDerivedViews(t *testing.
 		{Namespace: "default", Name: "paid-orders-aggregate"},
 		{Namespace: "default", Name: "paid-orders-indexed"},
 	})
+}
+
+func TestInvariantsForSecretEnqueuesThroughDataSourceAndDerivedViewRefs(t *testing.T) {
+	dataSource := dataSourceObject("orders-postgres", "postgres", "orders-postgres-secret", nil)
+	searchView := derivedViewObject(
+		"orders-search-index",
+		"orders-postgres",
+		map[string]any{
+			"target": map[string]any{
+				"type":             "opensearch",
+				"connectionSecret": "orders-opensearch-secret",
+			},
+			"pipeline": map[string]any{
+				"type":             "kafka",
+				"connectionSecret": "orders-kafka-secret",
+			},
+		},
+	)
+	indexed := invariantObject("paid-orders-indexed", "existence", nil)
+	freshness := invariantObject("paid-orders-freshness", "freshness", nil)
+	warehouse := invariantObject("warehouse-indexed", "existence", nil)
+	setInvariantDerivedViewRef(warehouse, "warehouse-search-index")
+
+	reconciler := &InvariantReconciler{
+		Client: fake.NewClientBuilder().
+			WithObjects(dataSource, searchView, indexed, freshness, warehouse).
+			Build(),
+	}
+
+	for _, secretName := range []string{
+		"orders-postgres-secret",
+		"orders-opensearch-secret",
+		"orders-kafka-secret",
+	} {
+		secret := &corev1.Secret{}
+		secret.Name = secretName
+		secret.Namespace = "default"
+
+		requests := reconciler.invariantsForSecret(context.Background(), secret)
+		assertRequests(t, requests, []types.NamespacedName{
+			{Namespace: "default", Name: "paid-orders-freshness"},
+			{Namespace: "default", Name: "paid-orders-indexed"},
+		})
+	}
 }
 
 func TestBuildRepairJobUsesReportHandoffConfiguration(t *testing.T) {
@@ -395,13 +473,48 @@ func TestRepairPolicyAllowsAutoReindexRequiresExplicitUnsafeOptIn(t *testing.T) 
 		t.Fatal("repairPolicyAllowsAutoReindex = true for approval-required policy, want false")
 	}
 
-	unsupported := repairPolicyObject("paid-orders-indexed", false, "replay-kafka")
-	allowed, err = repairPolicyAllowsAutoReindex(unsupported)
+	safeDispatch := repairPolicyObject("paid-orders-indexed", false, "replay-kafka")
+	repairMode, allowedDispatch, err := repairPolicyAutoRepairMode(safeDispatch)
+	if err != nil {
+		t.Fatalf("repairPolicyAutoRepairMode returned error: %v", err)
+	}
+	if !allowedDispatch {
+		t.Fatal("repairPolicyAutoRepairMode = false for safe replay-kafka action, want true")
+	}
+	if repairMode != "replay-kafka" {
+		t.Fatalf("repair mode = %q, want replay-kafka", repairMode)
+	}
+
+	allowed, err = repairPolicyAllowsAutoReindex(safeDispatch)
 	if err != nil {
 		t.Fatalf("repairPolicyAllowsAutoReindex returned error: %v", err)
 	}
 	if allowed {
-		t.Fatal("repairPolicyAllowsAutoReindex = true for unsupported action, want false")
+		t.Fatal("repairPolicyAllowsAutoReindex = true for safe dispatch action, want false")
+	}
+}
+
+func TestRepairPolicyEnvProjectsActionConfiguration(t *testing.T) {
+	policy := repairPolicyObject("paid-orders-indexed", false, "call-webhook")
+	actions := policy.Object["spec"].(map[string]any)["actions"].([]any)
+	action := actions[0].(map[string]any)
+	action["endpoint"] = "http://orders.default.svc/reconcile"
+	action["batchSize"] = int64(250)
+
+	env := envByName(repairPolicyEnv(policy, "call-webhook"))
+	if env["REPAIR_WEBHOOK_URL"].Value != "http://orders.default.svc/reconcile" {
+		t.Fatalf("REPAIR_WEBHOOK_URL = %q", env["REPAIR_WEBHOOK_URL"].Value)
+	}
+	if env["REPAIR_WEBHOOK_BATCH_SIZE"].Value != "250" {
+		t.Fatalf("REPAIR_WEBHOOK_BATCH_SIZE = %q", env["REPAIR_WEBHOOK_BATCH_SIZE"].Value)
+	}
+
+	kafkaPolicy := repairPolicyObject("paid-orders-indexed", false, "replay-kafka")
+	kafkaAction := kafkaPolicy.Object["spec"].(map[string]any)["actions"].([]any)[0].(map[string]any)
+	kafkaAction["topic"] = "orders.reconcile"
+	env = envByName(repairPolicyEnv(kafkaPolicy, "replay-kafka"))
+	if env["REPAIR_KAFKA_TOPIC"].Value != "orders.reconcile" {
+		t.Fatalf("REPAIR_KAFKA_TOPIC = %q", env["REPAIR_KAFKA_TOPIC"].Value)
 	}
 }
 

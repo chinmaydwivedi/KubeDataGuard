@@ -8,6 +8,7 @@ volumes:
   postgres-data:
   redpanda-data:
   opensearch-data:
+  redis-data:
   minio-data:
 
 services:
@@ -113,6 +114,21 @@ services:
     networks:
       - dataguard
 
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    volumes:
+      - redis-data:/data
+    networks:
+      - dataguard
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -155,6 +171,8 @@ services:
       ORDER_EVENTS_TOPIC: orders.events
       OPENSEARCH_URL: http://opensearch:9200
       ORDERS_INDEX: orders
+      REDIS_URL: redis://redis:6379/0
+      ORDER_CACHE_PREFIX: order
       REPORT_DIR: /workspace/reports
       REPORT_STORE: ${REPORT_STORE:-local}
       REPORT_BUCKET: ${REPORT_BUCKET:-kubedataguard-reports}
@@ -171,6 +189,8 @@ services:
       redpanda-0:
         condition: service_started
       opensearch:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     profiles:
       - tools

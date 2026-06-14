@@ -39,12 +39,16 @@ spec:
                     properties:
                       type:
                         type: string
-                        enum: ["emit-reconcile-events", "call-webhook", "reindex-records", "replay-kafka", "invalidate-cache", "run-job"]
+                        enum: ["emit-reconcile-events", "call-webhook", "reindex-records", "replay-kafka", "invalidate-cache", "clickhouse-backfill", "run-job"]
                       batchSize:
                         type: integer
                       endpoint:
                         type: string
                       topic:
+                        type: string
+                      keyTemplate:
+                        type: string
+                      table:
                         type: string
                       jobTemplateRef:
                         type: string

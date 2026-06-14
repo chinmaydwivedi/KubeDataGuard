@@ -7,6 +7,15 @@ from pathlib import Path
 
 from .config import Settings
 
+REPAIR_MODE_CHOICES = [
+    "direct-reindex",
+    "emit-reconcile-events",
+    "replay-kafka",
+    "call-webhook",
+    "invalidate-cache",
+    "clickhouse-backfill",
+]
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -32,6 +41,15 @@ def main() -> None:
         help="simulate a bug by committing every Nth paid event without indexing it",
     )
 
+    cache_index_parser = subcommands.add_parser("cache-index", help="consume order events into Redis cache")
+    cache_index_parser.add_argument("--group-id", default="orders-redis-cache-indexer")
+    cache_index_parser.add_argument("--max-messages", type=int)
+    cache_index_parser.add_argument(
+        "--skip-every-paid",
+        type=int,
+        help="simulate a bug by committing every Nth paid event without caching it",
+    )
+
     freshness_drift_parser = subcommands.add_parser(
         "inject-freshness-drift",
         help="simulate a stale derived view that violates bounded freshness",
@@ -44,7 +62,7 @@ def main() -> None:
     check_parser.add_argument("--max-lag-seconds", type=int, default=60)
     check_parser.add_argument(
         "--invariant",
-        choices=["existence", "aggregate", "freshness", "query"],
+        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
         default="existence",
         help="which invariant to check",
     )
@@ -58,7 +76,7 @@ def main() -> None:
     check_job_parser.add_argument("--max-lag-seconds", type=int, default=60)
     check_job_parser.add_argument(
         "--invariant",
-        choices=["existence", "aggregate", "freshness", "query"],
+        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
         default="existence",
         help="which invariant to check",
     )
@@ -73,14 +91,14 @@ def main() -> None:
     repair_parser.add_argument("--report", type=Path)
     repair_parser.add_argument(
         "--repair-mode",
-        choices=["direct-reindex", "emit-reconcile-events"],
+        choices=REPAIR_MODE_CHOICES,
         default="direct-reindex",
     )
     repair_parser.add_argument("--verify", action="store_true")
     repair_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_parser.add_argument(
         "--verify-invariant",
-        choices=["existence", "aggregate", "freshness", "query"],
+        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
         default="existence",
     )
     add_query_args(repair_parser)
@@ -97,13 +115,13 @@ def main() -> None:
     repair_job_parser.add_argument("--check-id", default="")
     repair_job_parser.add_argument(
         "--repair-mode",
-        choices=["direct-reindex", "emit-reconcile-events"],
+        choices=REPAIR_MODE_CHOICES,
         default="direct-reindex",
     )
     repair_job_parser.add_argument("--max-lag-seconds", type=int, default=60)
     repair_job_parser.add_argument(
         "--verify-invariant",
-        choices=["existence", "aggregate", "freshness", "query"],
+        choices=["existence", "aggregate", "freshness", "redis-freshness", "query"],
         default="existence",
     )
     add_query_args(repair_job_parser)
@@ -124,6 +142,8 @@ def main() -> None:
         run_generate(settings, args)
     elif args.command == "index":
         run_index(settings, args)
+    elif args.command == "cache-index":
+        run_cache_index(settings, args)
     elif args.command == "inject-freshness-drift":
         run_inject_freshness_drift(settings, args)
     elif args.command == "check":
@@ -156,6 +176,13 @@ def run_init(settings: Settings, *, reset: bool) -> None:
         print("resetting demo data and OpenSearch index")
         db.reset_demo_data(settings)
         search.reset_index(settings)
+        try:
+            from . import cache
+
+            deleted = cache.reset_order_cache(settings)
+            print(f"reset Redis order cache keys: {deleted}")
+        except Exception as exc:
+            print(f"skipped Redis cache reset: {exc}")
     else:
         print("ensuring OpenSearch index")
         search.ensure_index(settings)
@@ -178,6 +205,18 @@ def run_index(settings: Settings, args: argparse.Namespace) -> None:
     from . import indexer
 
     result = indexer.run_indexer(
+        settings,
+        group_id=args.group_id,
+        max_messages=args.max_messages,
+        skip_every_paid=args.skip_every_paid,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def run_cache_index(settings: Settings, args: argparse.Namespace) -> None:
+    from . import cache_indexer
+
+    result = cache_indexer.run_cache_indexer(
         settings,
         group_id=args.group_id,
         max_messages=args.max_messages,
@@ -230,6 +269,7 @@ def run_inject_freshness_drift(settings: Settings, args: argparse.Namespace) -> 
 
 def run_check(settings: Settings, args: argparse.Namespace):
     from . import checker
+    from .observability import write_observability_artifacts
     from .reporting import write_report_artifacts
 
     report = check_invariant(
@@ -255,6 +295,7 @@ def run_check(settings: Settings, args: argparse.Namespace):
     if args.write_report:
         artifacts = write_report_artifacts(settings, report)
         update_scan_checkpoint_report_ref(settings, payload, artifacts.report_ref)
+        write_observability_artifacts(settings, payload)
         print(f"wrote {artifacts.json_path}")
         print(f"wrote {artifacts.markdown_path}")
         print(f"report ref {artifacts.report_ref}")
@@ -263,6 +304,7 @@ def run_check(settings: Settings, args: argparse.Namespace):
 def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
     from . import checker
     from .k8s_report import namespace_from_service_account, publish_report_configmap
+    from .observability import write_observability_artifacts
     from .reporting import write_report_artifacts
 
     report = check_invariant(
@@ -291,6 +333,9 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
     if args.check_id:
         status["checkID"] = args.check_id
     payload["kubernetes_status"] = status
+    if args.check_id:
+        payload["checkID"] = args.check_id
+    write_observability_artifacts(settings, payload, artifact_name=args.check_id or "latest")
 
     namespace = args.namespace or namespace_from_service_account()
     publish_report_configmap(
@@ -304,6 +349,7 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
 
 def run_repair(settings: Settings, args: argparse.Namespace) -> None:
     from . import checker, repair
+    from .observability import write_observability_artifacts
 
     report_path = args.report or settings.report_dir / "latest.json"
     result = repair.repair_from_report(settings, report_path, mode=args.repair_mode)
@@ -326,12 +372,15 @@ def run_repair(settings: Settings, args: argparse.Namespace) -> None:
             source_max_pages=args.source_max_pages,
         )
         print("post-repair verification:")
-        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        payload = report.to_dict()
+        write_observability_artifacts(settings, payload, artifact_name="post-repair")
+        print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
     from . import checker, repair
     from .k8s_report import namespace_from_service_account, publish_report_configmap, read_configmap_data
+    from .observability import write_observability_artifacts
     from .reporting import write_report_artifacts
 
     namespace = args.namespace or namespace_from_service_account()
@@ -374,6 +423,7 @@ def run_repair_job(settings: Settings, args: argparse.Namespace) -> None:
         observed_generation=args.observed_generation,
         check_id=args.check_id,
     )
+    write_observability_artifacts(settings, verification_payload, artifact_name=f"{args.check_id or 'repair'}-verification")
     publish_report_configmap(
         namespace=namespace,
         name=args.config_map,
@@ -429,6 +479,11 @@ def check_invariant(
         )
     if invariant == "freshness":
         return checker.check_paid_orders_freshness(
+            settings,
+            max_lag_seconds=max_lag_seconds,
+        )
+    if invariant == "redis-freshness":
+        return checker.check_paid_orders_redis_freshness(
             settings,
             max_lag_seconds=max_lag_seconds,
         )

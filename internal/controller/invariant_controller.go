@@ -8,6 +8,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -125,12 +126,14 @@ func (r *InvariantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	dataSource.SetGroupVersionKind(DataSourceGVK)
 	derivedView := &unstructured.Unstructured{}
 	derivedView.SetGroupVersionKind(DerivedViewGVK)
+	secret := &corev1.Secret{}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(invariant).
 		Owns(&batchv1.Job{}).
 		Watches(dataSource, handler.EnqueueRequestsFromMapFunc(r.invariantsForDataSource)).
 		Watches(derivedView, handler.EnqueueRequestsFromMapFunc(r.invariantsForDerivedView)).
+		Watches(secret, handler.EnqueueRequestsFromMapFunc(r.invariantsForSecret)).
 		Complete(r)
 }
 
@@ -176,6 +179,58 @@ func (r *InvariantReconciler) invariantsForDerivedView(ctx context.Context, obj 
 	)
 	if err != nil {
 		log.Error(err, "map derived view update to invariant reconciles", "derivedView", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+	return requests
+}
+
+func (r *InvariantReconciler) invariantsForSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	log := ctrl.LoggerFrom(ctx)
+	dataSources := &unstructured.UnstructuredList{}
+	dataSources.SetGroupVersionKind(DataSourceGVK.GroupVersion().WithKind("DataSourceList"))
+	if err := r.List(ctx, dataSources, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.Error(err, "list data sources for secret fan-out", "secret", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+
+	sourceNames := map[string]struct{}{}
+	for i := range dataSources.Items {
+		dataSource := &dataSources.Items[i]
+		connectionSecret, _, err := unstructured.NestedString(dataSource.Object, "spec", "connectionSecret")
+		if err != nil {
+			log.Error(err, "read datasource connectionSecret", "dataSource", client.ObjectKeyFromObject(dataSource))
+			continue
+		}
+		if connectionSecret == obj.GetName() {
+			sourceNames[dataSource.GetName()] = struct{}{}
+		}
+	}
+
+	derivedViews := &unstructured.UnstructuredList{}
+	derivedViews.SetGroupVersionKind(DerivedViewGVK.GroupVersion().WithKind("DerivedViewList"))
+	if err := r.List(ctx, derivedViews, client.InNamespace(obj.GetNamespace())); err != nil {
+		log.Error(err, "list derived views for secret fan-out", "secret", client.ObjectKeyFromObject(obj))
+		return nil
+	}
+
+	derivedViewNames := map[string]struct{}{}
+	for i := range derivedViews.Items {
+		derivedView := &derivedViews.Items[i]
+		sourceRef, _, _ := unstructured.NestedString(derivedView.Object, "spec", "sourceRef")
+		targetSecret, _, _ := unstructured.NestedString(derivedView.Object, "spec", "target", "connectionSecret")
+		pipelineSecret, _, _ := unstructured.NestedString(derivedView.Object, "spec", "pipeline", "connectionSecret")
+		_, sourceSecretMatched := sourceNames[sourceRef]
+		if sourceSecretMatched || targetSecret == obj.GetName() || pipelineSecret == obj.GetName() {
+			derivedViewNames[derivedView.GetName()] = struct{}{}
+		}
+	}
+	if len(derivedViewNames) == 0 {
+		return nil
+	}
+
+	requests, err := r.invariantRequestsForDerivedViewNames(ctx, obj.GetNamespace(), derivedViewNames)
+	if err != nil {
+		log.Error(err, "map secret update to invariant reconciles", "secret", client.ObjectKeyFromObject(obj))
 		return nil
 	}
 	return requests
@@ -292,6 +347,8 @@ func guaranteeForInvariantType(invariantType string) string {
 		return "aggregate"
 	case "freshness":
 		return "boundedFreshness"
+	case "redis-freshness":
+		return "cacheFreshness"
 	case "query":
 		return "query"
 	case "fieldEquality":
