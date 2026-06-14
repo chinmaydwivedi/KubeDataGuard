@@ -23,6 +23,7 @@ class ObservationWindow:
     stream_topic: str | None = None
     stream_offset_start: int | None = None
     stream_offset_end: int | None = None
+    cdc_frontier: dict[str, Any] | None = None
     source_scan: dict[str, Any] | None = None
     completeness: str = CHECK_COMPLETE
 
@@ -37,6 +38,7 @@ class ObservationWindow:
             "stream_topic": self.stream_topic,
             "stream_offset_start": self.stream_offset_start,
             "stream_offset_end": self.stream_offset_end,
+            "cdc_frontier": self.cdc_frontier,
             "source_scan": self.source_scan,
             "completeness": self.completeness,
         }
@@ -202,6 +204,8 @@ def compare_paid_orders_to_index(
     stream_topic: str | None = None,
     stream_offset_start: int | None = None,
     stream_offset_end: int | None = None,
+    source_lsn: str | None = None,
+    cdc_frontier: dict[str, Any] | None = None,
 ) -> DriftReport:
     missing: list[dict[str, Any]] = []
     stale: list[dict[str, Any]] = []
@@ -245,6 +249,8 @@ def compare_paid_orders_to_index(
             stream_topic=stream_topic,
             stream_offset_start=stream_offset_start,
             stream_offset_end=stream_offset_end,
+            source_lsn=source_lsn,
+            cdc_frontier=cdc_frontier,
         ),
     )
 
@@ -283,6 +289,7 @@ def compare_query_results(
     stream_offset_end: int | None = None,
     source_lsn: str | None = None,
     source_scan: dict[str, Any] | None = None,
+    cdc_frontier: dict[str, Any] | None = None,
     check_status: str = CHECK_COMPLETE,
 ) -> DriftReport:
     target_by_key = {
@@ -353,6 +360,7 @@ def compare_query_results(
             stream_offset_end=stream_offset_end,
             source_watermark=latest_source_watermark(source_rows),
             source_lsn=source_lsn,
+            cdc_frontier=cdc_frontier,
             source_scan=source_scan,
             completeness=check_status,
         ),
@@ -403,6 +411,8 @@ def compare_paid_order_aggregates(
     stream_topic: str | None = None,
     stream_offset_start: int | None = None,
     stream_offset_end: int | None = None,
+    source_lsn: str | None = None,
+    cdc_frontier: dict[str, Any] | None = None,
 ) -> DriftReport:
     mismatches: list[dict[str, Any]] = []
 
@@ -433,6 +443,8 @@ def compare_paid_order_aggregates(
             stream_topic=stream_topic,
             stream_offset_start=stream_offset_start,
             stream_offset_end=stream_offset_end,
+            source_lsn=source_lsn,
+            cdc_frontier=cdc_frontier,
             source_watermark=source_watermark,
         ),
     )
@@ -449,6 +461,7 @@ def compare_paid_order_freshness(
     stream_offset_start: int | None = None,
     stream_offset_end: int | None = None,
     source_lsn: str | None = None,
+    cdc_frontier: dict[str, Any] | None = None,
 ) -> DriftReport:
     checked_at = ensure_utc(checked_at or datetime.now(timezone.utc))
     freshness_violations: list[dict[str, Any]] = []
@@ -533,6 +546,7 @@ def compare_paid_order_freshness(
             stream_offset_end=stream_offset_end,
             source_watermark=latest_source_watermark(source_orders),
             source_lsn=source_lsn,
+            cdc_frontier=cdc_frontier,
         ),
     )
 
@@ -548,6 +562,7 @@ def build_observation_window(
     stream_offset_end: int | None = None,
     source_watermark: str | None = None,
     source_lsn: str | None = None,
+    cdc_frontier: dict[str, Any] | None = None,
     source_scan: dict[str, Any] | None = None,
     completeness: str = CHECK_COMPLETE,
 ) -> ObservationWindow:
@@ -567,6 +582,7 @@ def build_observation_window(
         stream_topic=stream_topic,
         stream_offset_start=stream_offset_start,
         stream_offset_end=stream_offset_end,
+        cdc_frontier=cdc_frontier,
         source_scan=source_scan,
         completeness=completeness,
     )
@@ -607,6 +623,7 @@ def kubernetes_observation_window(window: dict[str, Any] | None) -> dict[str, An
         "streamTopic": window.get("stream_topic"),
         "streamOffsetStart": window.get("stream_offset_start"),
         "streamOffsetEnd": window.get("stream_offset_end"),
+        "cdcFrontier": window.get("cdc_frontier"),
         "sourceScan": window.get("source_scan"),
         "completeness": window.get("completeness"),
     }

@@ -58,7 +58,7 @@ def producer(settings: Settings) -> KafkaProducer:
     )
 
 
-def publish_event(settings: Settings, event: dict[str, Any]) -> None:
+def publish_event(settings: Settings, event: dict[str, Any]) -> dict[str, Any]:
     client = producer(settings)
     try:
         future = client.send(
@@ -66,8 +66,14 @@ def publish_event(settings: Settings, event: dict[str, Any]) -> None:
             key=event["order_id"],
             value=event,
         )
-        future.get(timeout=30)
+        metadata = future.get(timeout=30)
         client.flush(timeout=30)
+        return {
+            "topic": metadata.topic,
+            "partition": metadata.partition,
+            "offset": metadata.offset,
+            "timestamp": getattr(metadata, "timestamp", None),
+        }
     finally:
         client.close()
 
@@ -115,7 +121,7 @@ def consume_events(
         client.close()
 
 
-def topic_offset_range(settings: Settings) -> dict[str, int | None]:
+def topic_offset_range(settings: Settings) -> dict[str, Any]:
     client = KafkaConsumer(
         bootstrap_servers=settings.kafka_bootstrap_servers,
         enable_auto_commit=False,
@@ -128,7 +134,13 @@ def topic_offset_range(settings: Settings) -> dict[str, int | None]:
     try:
         partitions = client.partitions_for_topic(settings.order_events_topic) or set()
         if not partitions:
-            return {"stream_offset_start": None, "stream_offset_end": None}
+            return {
+                "stream_offset_start": None,
+                "stream_offset_end": None,
+                "stream_partitions": 0,
+                "stream_event_count": None,
+                "stream_offsets": [],
+            }
 
         topic_partitions = [
             TopicPartition(settings.order_events_topic, partition)
@@ -138,9 +150,28 @@ def topic_offset_range(settings: Settings) -> dict[str, int | None]:
         ends = client.end_offsets(topic_partitions)
         start_values = [starts[item] for item in topic_partitions if item in starts]
         end_values = [ends[item] for item in topic_partitions if item in ends]
+        partition_offsets = []
+        event_count = 0
+        for item in topic_partitions:
+            start = starts.get(item)
+            end = ends.get(item)
+            if start is None or end is None:
+                continue
+            event_count += max(0, end - start)
+            partition_offsets.append(
+                {
+                    "partition": item.partition,
+                    "start": start,
+                    "end": end,
+                    "event_count": max(0, end - start),
+                }
+            )
         return {
             "stream_offset_start": min(start_values) if start_values else None,
             "stream_offset_end": max(end_values) if end_values else None,
+            "stream_partitions": len(partition_offsets),
+            "stream_event_count": event_count,
+            "stream_offsets": partition_offsets,
         }
     finally:
         client.close()

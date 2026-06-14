@@ -180,6 +180,7 @@ kubectl get jobs,pods,configmaps -l app.kubernetes.io/name=kubedataguard -o wide
 kubectl get configmaps -l app.kubernetes.io/name=kubedataguard
 kubectl get configmap <report-configmap-name> -o jsonpath='{.data.status\.json}'
 kubectl get configmap <repair-configmap-name> -o jsonpath='{.data.status\.json}'
+kubectl get invariant paid-orders-indexed -o jsonpath='{.status.observationWindow.cdcFrontier}'
 ```
 
 For scheduled checks, names include a time-slot check ID such as `g3-t29493510` instead of only `g3`.
@@ -503,6 +504,7 @@ Reports are not only pass/fail output. Key fields:
 - `observation_window`: the time and lag boundary used to decide which records are eligible
 - `observation_window.source_lsn`: the Postgres WAL position observed during freshness checks when available
 - `observation_window.stream_offset_start` and `stream_offset_end`: the event range associated with the check when available
+- `observation_window.cdc_frontier`: the first bounded-window proof chain, including Postgres WAL LSN, outbox publish counts, Kafka per-partition offsets, target applied offsets, and a `bounded`, `partial`, or `unavailable` status
 - `observation_window.source_scan`: keyset scan evidence for query invariants, including page size, pages read, rows read, first key, last key, resume key, query hash, checkpoint ref, and loaded checkpoint summary
 - `counterexamples`: short proof objects for missing, stale, or aggregate drift
 - `missing`, `stale`, `aggregate_mismatches`, `freshness_violations`: detailed current drift classes

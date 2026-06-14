@@ -144,6 +144,36 @@ def markdown_report(payload: dict[str, Any]) -> str:
                 "",
             ]
         )
+        if observation_window.get("cdc_frontier"):
+            cdc_frontier = observation_window["cdc_frontier"]
+            stream = cdc_frontier.get("stream") or {}
+            outbox = cdc_frontier.get("outbox") or {}
+            source = cdc_frontier.get("source") or {}
+            target = cdc_frontier.get("target") or {}
+            target_frontier = target.get("frontier") or {}
+            lines.extend(
+                [
+                    "## CDC Frontier",
+                    "",
+                    f"- Mode: `{cdc_frontier.get('mode')}`",
+                    f"- Status: `{cdc_frontier.get('status')}`",
+                    f"- Reason: `{cdc_frontier.get('reason')}`",
+                    f"- Source LSN: `{source.get('lsn')}`",
+                    f"- Source watermark: `{source.get('watermark')}`",
+                    f"- Outbox events: `{outbox.get('event_count')}`",
+                    f"- Outbox published: `{outbox.get('published_count')}`",
+                    f"- Outbox unpublished: `{outbox.get('unpublished_count')}`",
+                    f"- Outbox offset evidence: `{outbox.get('offset_recorded_count')}`",
+                    f"- Stream topic: `{stream.get('topic')}`",
+                    f"- Stream event count: `{stream.get('event_count')}`",
+                    f"- Stream offset start: `{stream.get('offset_start')}`",
+                    f"- Stream offset end: `{stream.get('offset_end')}`",
+                    f"- Target read at: `{target.get('read_at')}`",
+                    f"- Target offset evidence: `{target_frontier.get('offset_recorded_count')}`",
+                    f"- Target offset proof: `{target.get('offset_gap_proof')}`",
+                    "",
+                ]
+            )
         if observation_window.get("source_scan"):
             source_scan = observation_window["source_scan"]
             lines.extend(

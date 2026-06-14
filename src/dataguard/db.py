@@ -41,8 +41,20 @@ create table if not exists order_events_outbox (
     order_id uuid not null references orders(id),
     payload jsonb not null,
     created_at timestamptz not null default now(),
-    published_at timestamptz
+    published_at timestamptz,
+    published_topic text,
+    published_partition integer,
+    published_offset bigint
 );
+
+alter table order_events_outbox
+    add column if not exists published_topic text;
+
+alter table order_events_outbox
+    add column if not exists published_partition integer;
+
+alter table order_events_outbox
+    add column if not exists published_offset bigint;
 
 create index if not exists idx_orders_status_updated_at
     on orders(status, updated_at);
@@ -134,16 +146,26 @@ def insert_order_with_event(
     return payload
 
 
-def mark_event_published(settings: Settings, event_id: str) -> None:
+def mark_event_published(
+    settings: Settings,
+    event_id: str,
+    *,
+    published_topic: str | None = None,
+    published_partition: int | None = None,
+    published_offset: int | None = None,
+) -> None:
     with connect(settings) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 update order_events_outbox
-                set published_at = now()
+                set published_at = now(),
+                    published_topic = %s,
+                    published_partition = %s,
+                    published_offset = %s
                 where event_id = %s
                 """,
-                (event_id,),
+                (published_topic, published_partition, published_offset, event_id),
             )
         conn.commit()
 
@@ -227,6 +249,76 @@ def current_wal_lsn(settings: Settings) -> str:
             cur.execute("select pg_current_wal_lsn()::text as lsn")
             row = cur.fetchone()
     return str(row["lsn"])
+
+
+def outbox_frontier(settings: Settings, max_lag_seconds: int) -> dict[str, Any]:
+    with connect(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                with eligible as (
+                  select *
+                  from order_events_outbox
+                  where created_at <= now() - make_interval(secs => %s)
+                ),
+                partition_frontier as (
+                  select
+                    published_topic,
+                    published_partition,
+                    count(*)::integer as event_count,
+                    max(published_offset)::bigint as max_published_offset
+                  from eligible
+                  where published_at is not null
+                    and published_topic is not null
+                    and published_partition is not null
+                    and published_offset is not null
+                  group by published_topic, published_partition
+                )
+                select
+                  count(*)::integer as event_count,
+                  (count(*) filter (where published_at is not null))::integer as published_count,
+                  (count(*) filter (where published_at is null))::integer as unpublished_count,
+                  max(id)::bigint as max_id,
+                  max(created_at) as max_created_at,
+                  max(published_at) as max_published_at,
+                  (count(*) filter (
+                    where published_at is not null
+                      and published_topic is not null
+                      and published_partition is not null
+                      and published_offset is not null
+                  ))::integer as offset_recorded_count,
+                  coalesce(
+                    (
+                      select jsonb_agg(
+                        jsonb_build_object(
+                          'topic', published_topic,
+                          'partition', published_partition,
+                          'event_count', event_count,
+                          'max_published_offset', max_published_offset
+                        )
+                        order by published_topic, published_partition
+                      )
+                      from partition_frontier
+                    ),
+                    '[]'::jsonb
+                  )::text as published_offsets
+                from eligible
+                """,
+                (max_lag_seconds,),
+            )
+            row = cur.fetchone()
+
+    return {
+        "mode": "postgres-outbox",
+        "event_count": int(row["event_count"]),
+        "published_count": int(row["published_count"]),
+        "unpublished_count": int(row["unpublished_count"]),
+        "max_id": int(row["max_id"]) if row["max_id"] is not None else None,
+        "max_created_at": _iso(row["max_created_at"]) if row["max_created_at"] is not None else None,
+        "max_published_at": _iso(row["max_published_at"]) if row["max_published_at"] is not None else None,
+        "offset_recorded_count": int(row["offset_recorded_count"]),
+        "published_offsets": json.loads(row["published_offsets"] or "[]"),
+    }
 
 
 def fetch_orders_by_ids(settings: Settings, order_ids: Iterable[str]) -> list[dict[str, Any]]:

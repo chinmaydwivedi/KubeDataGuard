@@ -3,6 +3,7 @@ from __future__ import annotations
 import signal
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from typing import Any
 
 from . import checkpoints, db, search
 from .config import Settings
@@ -14,6 +15,7 @@ from .invariants import (
     compare_paid_orders_to_index,
     compare_query_results,
     iso,
+    latest_source_watermark,
 )
 
 
@@ -25,16 +27,28 @@ def check_paid_orders_indexed(
     checked_at = datetime.now(timezone.utc)
     offsets = stream_offsets(settings)
     source_orders = db.fetch_paid_orders(settings, max_lag_seconds=max_lag_seconds)
+    source_lsn = source_lsn_or_none(settings)
     indexed_orders = search.mget_orders(settings, [order["id"] for order in source_orders])
+    target_read_at = datetime.now(timezone.utc)
+    cdc_frontier = build_check_cdc_frontier(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        source_lsn=source_lsn,
+        source_watermark=latest_source_watermark(source_orders),
+        offsets=offsets,
+        target_read_at=target_read_at,
+    )
     return compare_paid_orders_to_index(
         source_orders,
         indexed_orders,
         max_lag_seconds=max_lag_seconds,
         checked_at=checked_at,
-        target_read_at=datetime.now(timezone.utc),
+        target_read_at=target_read_at,
         stream_topic=settings.order_events_topic,
         stream_offset_start=offsets["stream_offset_start"],
         stream_offset_end=offsets["stream_offset_end"],
+        source_lsn=source_lsn,
+        cdc_frontier=cdc_frontier,
     )
 
 
@@ -50,19 +64,31 @@ def check_paid_orders_aggregate(
         settings,
         max_lag_seconds=max_lag_seconds,
     )
+    source_lsn = source_lsn_or_none(settings)
     target_summary = search.paid_order_summary(
         settings,
         updated_before=iso(eligible_before),
+    )
+    target_read_at = datetime.now(timezone.utc)
+    cdc_frontier = build_check_cdc_frontier(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        source_lsn=source_lsn,
+        source_watermark=source_summary.get("source_watermark"),
+        offsets=offsets,
+        target_read_at=target_read_at,
     )
     return compare_paid_order_aggregates(
         source_summary,
         target_summary,
         max_lag_seconds=max_lag_seconds,
         checked_at=checked_at,
-        target_read_at=datetime.now(timezone.utc),
+        target_read_at=target_read_at,
         stream_topic=settings.order_events_topic,
         stream_offset_start=offsets["stream_offset_start"],
         stream_offset_end=offsets["stream_offset_end"],
+        source_lsn=source_lsn,
+        cdc_frontier=cdc_frontier,
     )
 
 
@@ -73,19 +99,29 @@ def check_paid_orders_freshness(
 ) -> DriftReport:
     checked_at = datetime.now(timezone.utc)
     offsets = stream_offsets(settings)
-    source_lsn = db.current_wal_lsn(settings)
     source_orders = db.fetch_paid_orders(settings, max_lag_seconds=max_lag_seconds)
+    source_lsn = source_lsn_or_none(settings)
     indexed_orders = search.mget_orders(settings, [order["id"] for order in source_orders])
+    target_read_at = datetime.now(timezone.utc)
+    cdc_frontier = build_check_cdc_frontier(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        source_lsn=source_lsn,
+        source_watermark=latest_source_watermark(source_orders),
+        offsets=offsets,
+        target_read_at=target_read_at,
+    )
     return compare_paid_order_freshness(
         source_orders,
         indexed_orders,
         max_lag_seconds=max_lag_seconds,
         checked_at=checked_at,
-        target_read_at=datetime.now(timezone.utc),
+        target_read_at=target_read_at,
         stream_topic=settings.order_events_topic,
         stream_offset_start=offsets["stream_offset_start"],
         stream_offset_end=offsets["stream_offset_end"],
         source_lsn=source_lsn,
+        cdc_frontier=cdc_frontier,
     )
 
 
@@ -107,7 +143,7 @@ def check_query_invariant(
 ) -> DriftReport:
     checked_at = datetime.now(timezone.utc)
     offsets = stream_offsets(settings)
-    source_lsn = db.current_wal_lsn(settings)
+    source_lsn = source_lsn_or_none(settings)
     checkpoint_ref: str | None = None
     loaded_checkpoint = None
     query_hash = scan_query_hash(source_query=source_query, target_query=target_query, key_field=key_field)
@@ -161,6 +197,7 @@ def check_query_invariant(
         target_query,
         key_field=key_field,
     )
+    target_read_at = datetime.now(timezone.utc)
     guarantee = "existence"
     if compare_fields:
         guarantee = "existence+fieldEquality"
@@ -180,6 +217,14 @@ def check_query_invariant(
     check_status = CHECK_COMPLETE
     if source_resume_after_key or not source_scan.evidence.get("completed", True):
         check_status = "partial"
+    cdc_frontier = build_check_cdc_frontier(
+        settings,
+        max_lag_seconds=max_lag_seconds,
+        source_lsn=source_lsn,
+        source_watermark=scan_evidence.get("source_watermark"),
+        offsets=offsets,
+        target_read_at=target_read_at,
+    )
     return compare_query_results(
         invariant_name=invariant_name,
         source_rows=source_scan.rows,
@@ -189,11 +234,12 @@ def check_query_invariant(
         guarantee=guarantee,
         max_lag_seconds=max_lag_seconds,
         checked_at=checked_at,
-        target_read_at=datetime.now(timezone.utc),
+        target_read_at=target_read_at,
         stream_topic=settings.order_events_topic,
         stream_offset_start=offsets["stream_offset_start"],
         stream_offset_end=offsets["stream_offset_end"],
         source_lsn=source_lsn,
+        cdc_frontier=cdc_frontier,
         source_scan=scan_evidence,
         check_status=check_status,
     )
@@ -204,7 +250,7 @@ def scan_query_hash(*, source_query: str, target_query: str, key_field: str) -> 
     return sha256(payload.encode("utf-8")).hexdigest()
 
 
-def stream_offsets(settings: Settings) -> dict[str, int | None]:
+def stream_offsets(settings: Settings) -> dict[str, Any]:
     from . import events
 
     class OffsetTimeout(Exception):
@@ -219,7 +265,179 @@ def stream_offsets(settings: Settings) -> dict[str, int | None]:
     try:
         return events.topic_offset_range(settings)
     except Exception:
-        return {"stream_offset_start": None, "stream_offset_end": None}
+        return {
+            "stream_offset_start": None,
+            "stream_offset_end": None,
+            "stream_partitions": 0,
+            "stream_event_count": None,
+            "stream_offsets": [],
+        }
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
+
+
+def source_lsn_or_none(settings: Settings) -> str | None:
+    try:
+        return db.current_wal_lsn(settings)
+    except Exception:
+        return None
+
+
+def build_check_cdc_frontier(
+    settings: Settings,
+    *,
+    max_lag_seconds: int,
+    source_lsn: str | None,
+    source_watermark: str | None,
+    offsets: dict[str, Any],
+    target_read_at: datetime,
+) -> dict[str, Any]:
+    try:
+        outbox = db.outbox_frontier(settings, max_lag_seconds=max_lag_seconds)
+    except Exception as exc:
+        outbox = {
+            "mode": "postgres-outbox",
+            "available": False,
+            "error": str(exc),
+        }
+    try:
+        target_frontier = search.target_offset_frontier(settings)
+    except Exception as exc:
+        target_frontier = {
+            "system": "opensearch",
+            "available": False,
+            "error": str(exc),
+        }
+    return build_cdc_frontier(
+        source_lsn=source_lsn,
+        source_watermark=source_watermark,
+        outbox=outbox,
+        offsets=offsets,
+        stream_topic=settings.order_events_topic,
+        target_read_at=target_read_at,
+        target_frontier=target_frontier,
+    )
+
+
+def build_cdc_frontier(
+    *,
+    source_lsn: str | None,
+    source_watermark: str | None,
+    outbox: dict[str, Any] | None,
+    offsets: dict[str, Any],
+    stream_topic: str,
+    target_read_at: datetime,
+    target_frontier: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    status = "bounded"
+
+    if not source_lsn:
+        status = "partial"
+        reasons.append("source WAL LSN unavailable")
+
+    outbox_available = bool(outbox and outbox.get("available", True))
+    if not outbox_available:
+        status = "partial"
+        reasons.append("source outbox frontier unavailable")
+
+    published_count = int((outbox or {}).get("published_count") or 0)
+    unpublished_count = int((outbox or {}).get("unpublished_count") or 0)
+    offset_recorded_count = int((outbox or {}).get("offset_recorded_count") or 0)
+    if outbox_available and unpublished_count > 0:
+        status = "partial"
+        reasons.append(f"{unpublished_count} eligible outbox events are unpublished")
+    if outbox_available and offset_recorded_count < published_count:
+        status = "partial"
+        missing_offsets = published_count - offset_recorded_count
+        reasons.append(f"{missing_offsets} published outbox events have no Kafka offset evidence")
+
+    stream_event_count = offsets.get("stream_event_count")
+    stream_offset_start = offsets.get("stream_offset_start")
+    stream_offset_end = offsets.get("stream_offset_end")
+    if stream_event_count is None or stream_offset_start is None or stream_offset_end is None:
+        status = "partial"
+        reasons.append("Kafka topic offset frontier unavailable")
+    elif outbox_available and int(stream_event_count) < published_count:
+        status = "partial"
+        reasons.append(
+            f"Kafka topic exposes {stream_event_count} events but outbox has {published_count} published events"
+        )
+
+    partition_ends = {
+        (stream_topic, item.get("partition")): item.get("end")
+        for item in offsets.get("stream_offsets") or []
+    }
+    target_available = bool(target_frontier and target_frontier.get("available", True))
+    if not target_available:
+        status = "partial"
+        reasons.append("target applied-offset frontier unavailable")
+    target_offsets = {
+        (item.get("topic"), item.get("partition")): item.get("max_applied_offset")
+        for item in (target_frontier or {}).get("applied_offsets") or []
+    }
+    for published_offset in (outbox or {}).get("published_offsets") or []:
+        topic = published_offset.get("topic")
+        partition = published_offset.get("partition")
+        max_published_offset = published_offset.get("max_published_offset")
+        if topic != stream_topic:
+            status = "partial"
+            reasons.append(
+                f"outbox event frontier is for topic {topic!r}, not configured topic {stream_topic!r}"
+            )
+            continue
+        end_offset = partition_ends.get((topic, partition))
+        if end_offset is None or max_published_offset is None:
+            status = "partial"
+            reasons.append(f"Kafka partition {partition} frontier unavailable")
+            continue
+        if int(end_offset) <= int(max_published_offset):
+            status = "partial"
+            reasons.append(
+                "Kafka partition "
+                f"{partition} end offset {end_offset} does not cover "
+                f"published outbox offset {max_published_offset}"
+            )
+        if target_available:
+            target_max_offset = target_offsets.get((topic, partition))
+            if target_max_offset is None:
+                status = "partial"
+                reasons.append(f"target partition {partition} applied-offset frontier unavailable")
+            elif max_published_offset is not None and int(target_max_offset) < int(max_published_offset):
+                status = "partial"
+                reasons.append(
+                    "target partition "
+                    f"{partition} applied offset {target_max_offset} does not cover "
+                    f"published outbox offset {max_published_offset}"
+                )
+
+    if not source_lsn and not outbox_available and stream_event_count is None:
+        status = "unavailable"
+
+    return {
+        "mode": "postgres-wal+outbox+kafka",
+        "status": status,
+        "reason": "; ".join(reasons)
+        or "source WAL, outbox, Kafka topic, and target applied-offset frontiers bound this check",
+        "source": {
+            "system": "postgres",
+            "lsn": source_lsn,
+            "watermark": source_watermark,
+        },
+        "outbox": outbox,
+        "stream": {
+            "system": "kafka",
+            "topic": stream_topic,
+            "offset_start": stream_offset_start,
+            "offset_end": stream_offset_end,
+            "partitions": offsets.get("stream_partitions"),
+            "event_count": stream_event_count,
+            "partition_offsets": offsets.get("stream_offsets") or [],
+        },
+        "target": {
+            "read_at": iso(target_read_at),
+            "frontier": target_frontier,
+            "offset_gap_proof": "max-offset-watermark-only",
+        },
+    }

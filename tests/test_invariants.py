@@ -14,6 +14,7 @@ from dataguard.invariants import (
     summarize_paid_orders,
 )
 from dataguard.cli import build_repair_job_result
+from dataguard.checker import build_cdc_frontier
 from dataguard.checkpoints import (
     load_scan_checkpoint,
     save_scan_checkpoint,
@@ -88,6 +89,25 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(window["stream_topic"], "orders.events")
         self.assertEqual(window["stream_offset_start"], 10)
         self.assertEqual(window["stream_offset_end"], 15)
+
+    def test_observation_window_preserves_cdc_frontier(self):
+        cdc_frontier = {
+            "mode": "postgres-wal+outbox+kafka",
+            "status": "bounded",
+            "source": {"lsn": "0/16B6C50"},
+        }
+        report = compare_paid_orders_to_index(
+            [{"id": "order-1", "status": "paid", "amount_cents": 1200, "currency": "USD", "version": 1}],
+            {},
+            cdc_frontier=cdc_frontier,
+        )
+
+        payload = report.to_dict()
+        self.assertEqual(payload["observation_window"]["cdc_frontier"]["status"], "bounded")
+        self.assertEqual(
+            payload["kubernetes_status"]["observationWindow"]["cdcFrontier"]["source"]["lsn"],
+            "0/16B6C50",
+        )
 
     def test_report_includes_operator_status_payload(self):
         source = [
@@ -375,6 +395,239 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(payload["status"], "Unknown")
         self.assertEqual(payload["check_status"], "partial")
         self.assertEqual(payload["observation_window"]["completeness"], "partial")
+
+    def test_cdc_frontier_is_bounded_when_outbox_and_kafka_cover_same_events(self):
+        frontier = build_cdc_frontier(
+            source_lsn="0/16B6C50",
+            source_watermark="2026-06-12T12:00:00+00:00",
+            outbox={
+                "mode": "postgres-outbox",
+                "event_count": 50,
+                "published_count": 50,
+                "unpublished_count": 0,
+                "max_id": 50,
+                "offset_recorded_count": 50,
+                "published_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 50,
+                        "max_published_offset": 49,
+                    }
+                ],
+            },
+            offsets={
+                "stream_offset_start": 0,
+                "stream_offset_end": 50,
+                "stream_partitions": 1,
+                "stream_event_count": 50,
+                "stream_offsets": [{"partition": 0, "start": 0, "end": 50, "event_count": 50}],
+            },
+            stream_topic="orders.events",
+            target_read_at=datetime.fromisoformat("2026-06-12T12:00:05+00:00"),
+            target_frontier={
+                "system": "opensearch",
+                "index": "orders",
+                "offset_recorded_count": 50,
+                "applied_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 50,
+                        "max_applied_offset": 49,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(frontier["status"], "bounded")
+        self.assertEqual(frontier["stream"]["event_count"], 50)
+        self.assertEqual(frontier["outbox"]["published_count"], 50)
+        self.assertEqual(frontier["target"]["frontier"]["offset_recorded_count"], 50)
+
+    def test_cdc_frontier_is_partial_when_outbox_has_unpublished_events(self):
+        frontier = build_cdc_frontier(
+            source_lsn="0/16B6C50",
+            source_watermark="2026-06-12T12:00:00+00:00",
+            outbox={
+                "mode": "postgres-outbox",
+                "event_count": 50,
+                "published_count": 48,
+                "unpublished_count": 2,
+                "offset_recorded_count": 48,
+                "published_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 48,
+                        "max_published_offset": 47,
+                    }
+                ],
+            },
+            offsets={
+                "stream_offset_start": 0,
+                "stream_offset_end": 48,
+                "stream_partitions": 1,
+                "stream_event_count": 48,
+                "stream_offsets": [],
+            },
+            stream_topic="orders.events",
+            target_read_at=datetime.fromisoformat("2026-06-12T12:00:05+00:00"),
+            target_frontier={
+                "system": "opensearch",
+                "index": "orders",
+                "offset_recorded_count": 48,
+                "applied_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 48,
+                        "max_applied_offset": 47,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(frontier["status"], "partial")
+        self.assertIn("unpublished", frontier["reason"])
+
+    def test_cdc_frontier_is_partial_when_kafka_offsets_lag_outbox(self):
+        frontier = build_cdc_frontier(
+            source_lsn="0/16B6C50",
+            source_watermark="2026-06-12T12:00:00+00:00",
+            outbox={
+                "mode": "postgres-outbox",
+                "event_count": 50,
+                "published_count": 50,
+                "unpublished_count": 0,
+                "offset_recorded_count": 50,
+                "published_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 50,
+                        "max_published_offset": 49,
+                    }
+                ],
+            },
+            offsets={
+                "stream_offset_start": 0,
+                "stream_offset_end": 40,
+                "stream_partitions": 1,
+                "stream_event_count": 40,
+                "stream_offsets": [],
+            },
+            stream_topic="orders.events",
+            target_read_at=datetime.fromisoformat("2026-06-12T12:00:05+00:00"),
+            target_frontier={
+                "system": "opensearch",
+                "index": "orders",
+                "offset_recorded_count": 40,
+                "applied_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 40,
+                        "max_applied_offset": 39,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(frontier["status"], "partial")
+        self.assertIn("Kafka topic exposes 40 events", frontier["reason"])
+
+    def test_cdc_frontier_is_partial_when_published_events_lack_offsets(self):
+        frontier = build_cdc_frontier(
+            source_lsn="0/16B6C50",
+            source_watermark="2026-06-12T12:00:00+00:00",
+            outbox={
+                "mode": "postgres-outbox",
+                "event_count": 50,
+                "published_count": 50,
+                "unpublished_count": 0,
+                "offset_recorded_count": 48,
+                "published_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 48,
+                        "max_published_offset": 47,
+                    }
+                ],
+            },
+            offsets={
+                "stream_offset_start": 0,
+                "stream_offset_end": 50,
+                "stream_partitions": 1,
+                "stream_event_count": 50,
+                "stream_offsets": [{"partition": 0, "start": 0, "end": 50, "event_count": 50}],
+            },
+            stream_topic="orders.events",
+            target_read_at=datetime.fromisoformat("2026-06-12T12:00:05+00:00"),
+            target_frontier={
+                "system": "opensearch",
+                "index": "orders",
+                "offset_recorded_count": 48,
+                "applied_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 48,
+                        "max_applied_offset": 47,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(frontier["status"], "partial")
+        self.assertIn("no Kafka offset evidence", frontier["reason"])
+
+    def test_cdc_frontier_is_partial_when_target_offsets_lag_outbox(self):
+        frontier = build_cdc_frontier(
+            source_lsn="0/16B6C50",
+            source_watermark="2026-06-12T12:00:00+00:00",
+            outbox={
+                "mode": "postgres-outbox",
+                "event_count": 50,
+                "published_count": 50,
+                "unpublished_count": 0,
+                "offset_recorded_count": 50,
+                "published_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 50,
+                        "max_published_offset": 49,
+                    }
+                ],
+            },
+            offsets={
+                "stream_offset_start": 0,
+                "stream_offset_end": 50,
+                "stream_partitions": 1,
+                "stream_event_count": 50,
+                "stream_offsets": [{"partition": 0, "start": 0, "end": 50, "event_count": 50}],
+            },
+            stream_topic="orders.events",
+            target_read_at=datetime.fromisoformat("2026-06-12T12:00:05+00:00"),
+            target_frontier={
+                "system": "opensearch",
+                "index": "orders",
+                "offset_recorded_count": 40,
+                "applied_offsets": [
+                    {
+                        "topic": "orders.events",
+                        "partition": 0,
+                        "event_count": 40,
+                        "max_applied_offset": 39,
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(frontier["status"], "partial")
+        self.assertIn("target partition 0 applied offset 39", frontier["reason"])
 
     def test_local_proof_detects_repairs_and_verifies(self):
         result = run_local_proof(count=10, skip_every_paid=5)

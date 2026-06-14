@@ -16,6 +16,7 @@ What is implemented and verified:
 - Keyset-paginated Postgres source scans for query invariants, with source scan evidence in reports.
 - Persisted source-scan checkpoints for bounded query scans, stored in the same local or S3-compatible report store.
 - OpenSearch target query pagination with `search_after`; `size` is treated as page size, not a correctness cap.
+- First CDC frontier proof for the commerce path: Postgres WAL LSN, outbox publication state, Kafka partition offsets, and OpenSearch applied-offset evidence are recorded in the observation window.
 - A Go/controller-runtime operator that schedules checker and repair Jobs.
 - A Kubernetes-native kind demo stack for Postgres, Redpanda, OpenSearch, checker Jobs, and the operator.
 - Compact Kubernetes status handoff through ConfigMaps.
@@ -30,7 +31,7 @@ What is implemented and verified:
 What is intentionally not solved yet:
 
 - Arbitrary databases and target stores beyond the first Postgres/OpenSearch generic path.
-- Full DBLog-style CDC watermarks and crash-exact scan recovery.
+- Full DBLog-style logical decoding, exact snapshot-plus-log recovery, and crash-exact scan recovery.
 - Object-store lifecycle policy, retention, encryption, and report compaction.
 - Production repair integrations such as Kafka replay, webhook dispatch, cache invalidation, and analytics backfill.
 
@@ -197,7 +198,7 @@ The consistency-model papers push the project toward named guarantees instead of
 - Client-centric consistency: read-your-writes and monotonic-read claims hold for a traced client/session.
 - Causal consistency: if fact B depends on fact A, the derived system must not expose B without A.
 
-DBLog is the most important systems paper for the MVP. It shows why snapshot-plus-log CDC needs watermarks, chunk boundaries, and resumable scans. That should change the design of KubeDataGuard reports and status: checks should eventually record `sourceWatermark`, `eventOffset`, `snapshotWindow`, `consumerGroup`, `lagSeconds`, and `replayScope`. Without those fields, a repair can say "I fixed rows" but cannot prove which part of history was actually covered.
+DBLog is the most important systems paper for the MVP. It shows why snapshot-plus-log CDC needs watermarks, chunk boundaries, and resumable scans. The commerce path now records a first frontier chain: source WAL LSN, source watermark, outbox publication counts, per-partition Kafka offsets, target applied-offset evidence, and target read time. That is not full logical-decoding CDC yet, but it stops the report from pretending that a moving source and moving target were compared without boundaries.
 
 The polyglot-persistence papers sharpen the novelty claim. The problem is not only that Postgres, Kafka, OpenSearch, Redis, and ClickHouse exist. The problem is that business truth leaks across them, and each store has different query semantics, failure modes, indexes, and freshness behavior. KubeDataGuard's CRDs are valuable only if they can describe those heterogeneous links without hiding the evidence.
 
@@ -698,7 +699,8 @@ Current report shape:
 
 - `status`: compact control-plane phase such as `Healthy` or `DriftDetected`
 - `guarantee`: the semantic claim being checked
-- `observation_window`: check time, target read time, max lag, eligible source boundary, source LSN, stream topic, and stream offset range
+- `observation_window`: check time, target read time, max lag, eligible source boundary, source LSN, stream topic, stream offset range, and CDC frontier evidence when available
+- `observation_window.cdc_frontier`: Postgres WAL/outbox, Kafka offset, and OpenSearch applied-offset proof metadata for deciding whether the checked window was bounded, partial, or unavailable
 - `observation_window.source_scan`: keyset scan mode, key field, page size, page count, row count, first key, last key, resume key, query hash, and checkpoint reference when enabled
 - `kubernetes_status`: compact status payload used by the job-backed operator
 - `checkID`: generation or scheduled interval identifier used to make repeated checks idempotent
@@ -787,7 +789,7 @@ Expected behavior:
 ### Milestone 3: More Invariant Types
 
 - Implemented aggregate checks: paid order count and revenue total
-- Implemented bounded freshness checks using source `updated_at`, target `indexed_at`, Postgres LSN, and Kafka offset evidence
+- Implemented bounded freshness checks using source `updated_at`, target `indexed_at`, Postgres LSN, Kafka offset evidence, and target applied-offset evidence
 - Implemented freshness drift injection and freshness repair verification
 - Implemented first generic Postgres/OpenSearch query invariant path
 - Implemented persisted checkpoint state for bounded source scans

@@ -25,8 +25,14 @@ def generate_orders(
             status=status,
             amount_cents=rng.randint(1000, 25000),
         )
-        events.publish_event(settings, event)
-        db.mark_event_published(settings, event["event_id"])
+        publish_metadata = events.publish_event(settings, event)
+        db.mark_event_published(
+            settings,
+            event["event_id"],
+            published_topic=publish_metadata["topic"],
+            published_partition=publish_metadata["partition"],
+            published_offset=publish_metadata["offset"],
+        )
         generated.append(event)
         print(
             f"generated {index + 1:03d}/{count}: "
@@ -34,4 +40,3 @@ def generate_orders(
         )
 
     return generated
-

@@ -31,6 +31,12 @@ INDEX_BODY = {
             "created_at": {"type": "date"},
             "updated_at": {"type": "date"},
             "indexed_at": {"type": "date"},
+            "dataguard_event_id": {"type": "keyword"},
+            "dataguard_event_type": {"type": "keyword"},
+            "dataguard_indexed_from": {"type": "keyword"},
+            "dataguard_topic": {"type": "keyword"},
+            "dataguard_partition": {"type": "integer"},
+            "dataguard_offset": {"type": "long"},
         }
     },
 }
@@ -72,9 +78,22 @@ def reset_index(settings: Settings) -> None:
     os_client.indices.create(index=settings.orders_index, body=INDEX_BODY)
 
 
-def index_order(settings: Settings, order: dict[str, Any], *, refresh: bool = False) -> None:
+def index_order(
+    settings: Settings,
+    order: dict[str, Any],
+    *,
+    refresh: bool = False,
+    event_metadata: dict[str, Any] | None = None,
+) -> None:
     document = dict(order)
     document["indexed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    document["dataguard_indexed_from"] = "kafka" if event_metadata else "source"
+    if event_metadata:
+        document["dataguard_event_id"] = event_metadata.get("event_id")
+        document["dataguard_event_type"] = event_metadata.get("event_type")
+        document["dataguard_topic"] = event_metadata.get("topic")
+        document["dataguard_partition"] = event_metadata.get("partition")
+        document["dataguard_offset"] = event_metadata.get("offset")
     os_client = client(settings)
     os_client.index(
         index=settings.orders_index,
@@ -144,6 +163,62 @@ def paid_order_summary(
     return {
         "count": int(count),
         "total_amount_cents": int(total_amount),
+    }
+
+
+def target_offset_frontier(settings: Settings) -> dict[str, Any]:
+    os_client = client(settings)
+    response = os_client.search(
+        index=settings.orders_index,
+        body={
+            "size": 0,
+            "query": {
+                "bool": {
+                    "filter": [
+                        {"exists": {"field": "dataguard_offset"}},
+                        {"exists": {"field": "dataguard_topic"}},
+                        {"exists": {"field": "dataguard_partition"}},
+                    ]
+                }
+            },
+            "aggs": {
+                "topics": {
+                    "terms": {"field": "dataguard_topic", "size": 50},
+                    "aggs": {
+                        "partitions": {
+                            "terms": {"field": "dataguard_partition", "size": 200},
+                            "aggs": {
+                                "max_offset": {"max": {"field": "dataguard_offset"}},
+                                "event_count": {"value_count": {"field": "dataguard_offset"}},
+                            },
+                        }
+                    },
+                }
+            },
+        },
+    )
+
+    offsets: list[dict[str, Any]] = []
+    for topic_bucket in response.get("aggregations", {}).get("topics", {}).get("buckets", []):
+        topic = topic_bucket.get("key")
+        for partition_bucket in topic_bucket.get("partitions", {}).get("buckets", []):
+            max_offset = partition_bucket.get("max_offset", {}).get("value")
+            offsets.append(
+                {
+                    "topic": topic,
+                    "partition": int(partition_bucket["key"]),
+                    "event_count": int(partition_bucket.get("event_count", {}).get("value") or 0),
+                    "max_applied_offset": int(max_offset) if max_offset is not None else None,
+                }
+            )
+
+    total = response.get("hits", {}).get("total", 0)
+    count = total.get("value", 0) if isinstance(total, dict) else total
+    return {
+        "system": "opensearch",
+        "index": settings.orders_index,
+        "offset_recorded_count": int(count),
+        "applied_offsets": offsets,
     }
 
 

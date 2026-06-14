@@ -119,6 +119,9 @@ spec:
                       type: integer
                     streamOffsetEnd:
                       type: integer
+                    cdcFrontier:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
                     sourceScan:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true

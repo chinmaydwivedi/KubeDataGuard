@@ -2,9 +2,9 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView watch fan-out to dependent Invariants, and a Kubernetes-native demo stack manifest.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView watch fan-out to dependent Invariants, a Kubernetes-native demo stack manifest, and a first CDC frontier proof across Postgres WAL/outbox, Kafka offsets, and OpenSearch applied-offset evidence.
 
-The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch demo stack, and deeper docs.
+The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, CDC frontier evidence, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch demo stack, and deeper docs.
 
 ## Decisions Made
 
@@ -528,7 +528,7 @@ What remains intentionally open:
 
 ```text
 generic query support is currently Postgres -> OpenSearch only
-full DBLog-style watermarks, CDC/log-bound scan completion, and crash-exact scan recovery still need implementation
+first commerce CDC frontier proof is implemented, but full DBLog logical decoding, CDC-bound generic scans, and crash-exact scan recovery still need implementation
 object-store reports still need retention, encryption, lifecycle policy, and compaction
 production repair dispatch beyond local JSONL reconciliation events remains future work
 ```
@@ -596,7 +596,7 @@ What remains intentionally open:
 
 ```text
 source scan checkpoints now persist the last processed key, but not a full source snapshot proof
-source snapshot watermarks are still not tied to Kafka/CDC offsets yet
+generic query source scan watermarks are not yet tied to Kafka/CDC offsets
 parallel chunk scans and Merkle/checksum comparison are not implemented yet
 ```
 
@@ -660,7 +660,7 @@ What remains intentionally open:
 
 ```text
 Resumed suffix scans are marked partial; they are not represented as complete snapshots.
-There is still no WAL/LSN-to-target proof that the target has processed the exact same source frontier.
+The commerce path has a first WAL/outbox/Kafka/target-applied-offset frontier, but generic resumed scans are not yet bound to that frontier.
 There is no parallel chunk scheduler or Merkle/checksum narrowing yet.
 ```
 
@@ -1098,11 +1098,100 @@ Do not jump directly from Compose verification to a full controller. Build these
 
 The paper set changes the project from a useful demo into a credible data-correctness control plane.
 
+## Latest CDC Frontier Pass
+
+Implemented now:
+
+- Added Kafka publish metadata to the Postgres outbox:
+  - topic
+  - partition
+  - offset
+- Added OpenSearch indexing metadata for events consumed from Kafka:
+  - event id
+  - event type
+  - topic
+  - partition
+  - offset
+- Added `cdc_frontier` to report observation windows and `cdcFrontier` to Kubernetes status.
+- Added a bounded-window proof builder that classifies the frontier as:
+  - `bounded`
+  - `partial`
+  - `unavailable`
+- The proof combines:
+  - Postgres WAL LSN
+  - source timestamp watermark
+  - eligible outbox count
+  - published/unpublished outbox count
+  - per-partition published outbox offsets
+  - Kafka beginning/end offsets
+  - OpenSearch applied-offset evidence
+  - target read time
+- Added unit tests for:
+  - preserving CDC frontier evidence in reports and Kubernetes status
+  - bounded frontier when outbox, Kafka, and target evidence cover the same events
+  - partial frontier when outbox events are unpublished
+  - partial frontier when Kafka offsets lag outbox offsets
+  - partial frontier when target applied offsets lag outbox offsets
+  - partial frontier when published outbox events have no Kafka offset evidence
+
+Runtime-verified against the existing kind demo stack:
+
+```text
+reseeding produced 50 order events
+drift injection processed 50 events
+indexer wrote 42 documents
+indexer deliberately skipped 8 paid events after committing Kafka offsets
+
+paid-orders-indexed:
+  generation: 4
+  observedGeneration: 4
+  phase: DriftDetected
+  driftCount: 8
+  cdcFrontier.status: bounded
+  source.lsn: present
+  outbox.published_count: 50
+  outbox.unpublished_count: 0
+  outbox.offset_recorded_count: 50
+  stream.event_count: 100
+  stream.offset_end: 100
+  target.offset_recorded_count: 42
+  target.max_applied_offset: 99
+
+paid-orders-aggregate:
+  generation: 4
+  observedGeneration: 4
+  phase: DriftDetected
+  driftCount: 2
+  cdcFrontier.status: bounded
+
+paid-orders-freshness:
+  generation: 3
+  observedGeneration: 3
+  phase: DriftDetected
+  driftCount: 8
+```
+
+Important interpretation:
+
+```text
+The frontier being bounded does not mean the data is healthy.
+It means the moving-target excuse has been reduced: eligible source events were published, Kafka exposed the offsets, and the target had visible applied-offset evidence up to the frontier.
+The invariant still reports drift because eight paid orders are missing from OpenSearch.
+```
+
+Still not full DBLog:
+
+- no Postgres logical decoding slot
+- no exact snapshot-plus-log handoff protocol
+- no crash-exact resume after checker failure
+- no Merkle/checksum narrowing for huge histories
+- no proof that max target offset implies gap-free application for arbitrary derived views
+
 ### CDC Evidence
 
 DBLog makes watermarks and replay boundaries non-optional for the mature design.
 
-Add these fields to reports before the controller phase:
+The first commerce path now carries these fields in `observation_window.cdc_frontier`. The mature design still needs to generalize them beyond the demo pipeline:
 
 - `sourceWatermark`
 - `sourceSnapshotStartedAt`
@@ -1209,13 +1298,15 @@ Expected behavior:
    - repair Job crash before report publication
    - repair retry/idempotency
    - stale/corrupt target document
-2. Add CDC/log watermark proof for Postgres -> Kafka -> OpenSearch frontiers.
+2. Replace demo Deployments with production-grade stateful installs for Postgres, Redpanda, and OpenSearch.
 3. Add repair strategies beyond source-of-truth reindexing:
    - Kafka replay
    - Redis invalidation
    - ClickHouse aggregate backfill
 4. Add a second source/derived pair to prove the CRD abstraction beyond OpenSearch.
 5. Add Secret rotation fan-out or document that scheduled checks are the refresh boundary.
+6. Add Prometheus/OpenTelemetry metrics and traces for checks, repairs, frontier status, and SLO breaches.
+7. Harden report retention, encryption, lifecycle policy, and compaction.
 
 ## Open Questions
 
@@ -1245,7 +1336,7 @@ Current answer:
 - Persisted scan checkpoints are implemented for bounded keyset scans.
 - Secret-backed `DataSource` and `DerivedView` resolution is implemented for the job-backed operator.
 - `DataSource` and `DerivedView` topology changes now enqueue affected `Invariant`s.
-- Next: CDC watermarks, checksum/Merkle narrowing, and a second source/derived pair.
+- Next: production-grade stateful installs, checksum/Merkle narrowing, and a second source/derived pair.
 
 ### Future
 

@@ -35,7 +35,18 @@ def run_indexer(
                 )
                 continue
 
-        search.index_order(settings, event["order"], refresh=False)
+        search.index_order(
+            settings,
+            event["order"],
+            refresh=False,
+            event_metadata={
+                "event_id": event.get("event_id"),
+                "event_type": event.get("event_type"),
+                "topic": item["topic"],
+                "partition": item["partition"],
+                "offset": item["offset"],
+            },
+        )
         indexed += 1
         item["commit"]()
         print(
@@ -48,4 +59,3 @@ def run_indexer(
         "indexed": indexed,
         "skipped": skipped,
     }
-

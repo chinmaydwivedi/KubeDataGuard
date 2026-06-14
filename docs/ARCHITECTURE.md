@@ -72,6 +72,7 @@ stream_topic
 source_lsn
 stream_offset_start
 stream_offset_end
+cdc_frontier
 completeness
 ```
 
@@ -126,7 +127,7 @@ check command
   |-- query paid orders from Postgres
   |-- mget same ids from OpenSearch
   |-- classify missing/stale/aggregate/freshness drift
-  |-- preserve source LSN and stream offset evidence
+  |-- preserve source LSN, outbox, stream offset, and target applied-offset evidence
   |-- write JSON/Markdown reports locally and optionally to S3/MinIO
   |
 repair command
@@ -253,6 +254,10 @@ stream_topic
 stream_partition
 stream_offset_start
 stream_offset_end
+cdc_frontier_status
+outbox_published_count
+kafka_partition_offsets
+target_applied_offsets
 target_read_at
 observed_lag_seconds
 counterexamples
@@ -366,7 +371,7 @@ optional compareFields equality
 
 The older commerce checks remain as optimized hardcoded demo invariants. The `query` invariant type is the first step toward making `sourceQuery` and `targetQuery` executable API fields rather than documentation-only fields. Source scans now wrap the declared query as a subquery, order by `keyField`, and fetch pages with `sourceScanPageSize`.
 
-When `sourceCheckpointId` is set, bounded scans persist checkpoint state in the worker report store after each page and again at the end of the run. The checkpoint stores the query hash, check ID, key field, first and last scanned key, source watermark, source LSN, page count, row count, and stop reason. That lets the next run resume from the last processed key instead of restarting a large scan. This is still not full DBLog semantics: there is no WAL-offset-to-target proof yet, and a resumed suffix scan is marked `partial` rather than pretending it is a complete source/target snapshot.
+When `sourceCheckpointId` is set, bounded scans persist checkpoint state in the worker report store after each page and again at the end of the run. The checkpoint stores the query hash, check ID, key field, first and last scanned key, source watermark, source LSN, page count, row count, and stop reason. That lets the next run resume from the last processed key instead of restarting a large scan. The commerce path now has a first WAL/outbox/Kafka/target-applied-offset frontier, but this is still not full DBLog semantics: there is no logical decoding stream, no crash-exact snapshot-plus-log recovery, and a resumed suffix scan is marked `partial` rather than pretending it is a complete source/target snapshot.
 
 The job-backed path is enabled with:
 
