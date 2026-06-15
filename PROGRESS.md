@@ -2,7 +2,7 @@
 
 ## Current Status
 
-Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView/Secret watch fan-out to dependent Invariants, production-shaped demo StatefulSets, a first CDC frontier proof across Postgres WAL/outbox, Kafka offsets, and target applied-offset evidence, a second Postgres -> Redis cache freshness derived-view path, prefix-bucket checksum narrowing, and a Postgres -> ClickHouse analytics aggregate path.
+Status: Docker/Colima runtime demo and closed-loop Go/controller-runtime operator are implemented and verified; the architecture has been hardened against the first major critique, now has optional S3/MinIO-compatible evidence storage, keyset-paginated source scans, persisted source-scan checkpoints, Secret-backed DataSource/DerivedView connection resolution, DataSource/DerivedView/Secret watch fan-out to dependent Invariants, production-shaped demo StatefulSets, a first CDC frontier proof across Postgres WAL/outbox, Kafka offsets, and target applied-offset evidence, a second Postgres -> Redis cache freshness derived-view path, prefix-bucket checksum narrowing, and a Postgres -> ClickHouse analytics aggregate path. The full fresh-kind operator path has also been runtime-verified end to end: CRDs, StatefulSet demo stack, operator Deployment, checker Jobs, repair Job, compact report ConfigMaps, and `Invariant.status` updates.
 
 The project now has Docker Compose infrastructure, Python CLI commands, invariant logic, evidence-bearing reports, optional durable report publication, compact reports, local retention cleanup, keyset source scan evidence, scan checkpoint state, aggregate consistency checks, checksum/Merkle-style bucket evidence, CDC frontier evidence, Redis cache freshness checks, ClickHouse analytics aggregate checks, Prometheus/OTEL-shaped observability artifacts, a deterministic no-Docker proof path, repair logic, tests, Kubernetes CRDs, a Go/controller-runtime reconciler that launches Python checker and repair Jobs with Secret-backed connection env vars and topology/Secret-change fan-out, example resources, a kind-native Postgres/Redpanda/OpenSearch/Redis/ClickHouse demo stack, and deeper docs.
 
@@ -1398,6 +1398,97 @@ Implemented now:
 Runtime-verified now:
 
 - Python unit tests: 40 passed.
+
+## Latest Full Kind Operator Runtime Pass
+
+Runtime-verified now from a fresh kind cluster:
+
+- `kind delete cluster --name kubedataguard && make k8s-demo` completed.
+- Worker image built and loaded into kind:
+  - `kubedataguard-dataguard:latest`
+- Operator image built and loaded into kind:
+  - `kubedataguard-operator:latest`
+- In-cluster demo StatefulSets rolled out:
+  - `dataguard-postgres`
+  - `dataguard-redpanda`
+  - `dataguard-opensearch`
+  - `dataguard-redis`
+  - `dataguard-clickhouse`
+- In-cluster seed pod succeeded:
+  - initialized Postgres, Kafka topic, OpenSearch index, Redis cache namespace, and ClickHouse table
+  - generated 50 orders
+  - backfilled 41 paid orders into ClickHouse
+- In-cluster drift pod succeeded:
+  - processed 50 Kafka events
+  - indexed 42 OpenSearch documents
+  - deliberately skipped 8 paid orders after consuming events
+- CRDs, example resources, Secrets, DataSources, DerivedViews, Invariants, and RepairPolicies were applied.
+- `kubedataguard-operator` Deployment rolled out successfully.
+- Checker Jobs completed for all demo invariants.
+- Operator updated `Invariant.status` from compact checker report ConfigMaps.
+
+Observed checker result before repair:
+
+```text
+paid-orders-indexed: DriftDetected, driftCount=8
+paid-orders-aggregate: DriftDetected, driftCount=2
+paid-orders-checksum: DriftDetected, driftCount=16
+paid-orders-redis-cache-freshness: DriftDetected, driftCount=41
+paid-orders-clickhouse-aggregate: Healthy, driftCount=0
+paid-orders-freshness: Healthy, driftCount=0
+paid-orders-query-check: Healthy, driftCount=0
+```
+
+Repair proof:
+
+```text
+runtime-only patch:
+  RepairPolicy reconcile-missing-paid-orders
+  approvalRequired=false
+  action=reindex-records
+  annotation dataguard.io/allow-unsafe-direct-reindex=true
+
+new Invariant generation:
+  paid-orders-indexed generation 3
+  checker Job: dataguard-check-paid-orders-indexed-g3-t5938524
+  repair Job: dataguard-repair-paid-orders-indexed-g3-t5938524
+  repair report ConfigMap: dataguard-repair-report-paid-orders-indexed-g3-t5938524
+```
+
+The repair Job reindexed the 8 deliberately skipped paid orders and then verified the invariant:
+
+```text
+paid-orders-indexed:
+  phase: Healthy
+  driftCount: 0
+  checkedRecords: 41
+  repairAction: direct-reindex
+  checkID: g3-t5938524
+```
+
+Important safety note:
+
+```text
+Checked-in example RepairPolicies still default to approvalRequired=true.
+The direct-reindex repair was enabled only as a controlled runtime proof.
+Production-safe repair modes remain owner-executed reconciliation events, replay requests, webhook dispatch, Redis invalidation requests, and ClickHouse backfill requests.
+```
+
+Verification after the kind run:
+
+```text
+make test
+  Passed: 40 Python tests
+
+make operator-test
+  Passed: go test ./...
+
+python3 -m py_compile $(find src -name '*.py' | sort)
+  Passed
+
+Ruby YAML parse for Compose, CRDs, operator manifest, demo stack, and examples
+  Passed
+```
 - Python compile check: passed.
 - Go/controller tests: passed.
 - YAML parsing for Compose, CRDs, example resources, and Kubernetes manifests: passed.
