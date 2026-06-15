@@ -1372,18 +1372,71 @@ Implemented now:
   - Redis target applied-offset frontier
   - Redis cache invalidation repair request mode
 
+## Latest Failure Hardening Pass
+
+Implemented now:
+
+- Added checker and repair Job lifecycle controls:
+  - `spec.jobActiveDeadlineSeconds`
+  - `spec.jobTTLSecondsAfterFinished`
+  - annotation fallbacks for both knobs
+  - bounded values to avoid runaway worker Jobs
+- Added `activeDeadlineSeconds` to operator-created checker and repair Jobs.
+- Kept `backoffLimit=0` so failed checks do not silently retry and blur evidence.
+- Classified Kubernetes `DeadlineExceeded` Job failures as `checkStatus: timedOut`.
+- Preserved ordinary worker failures as `checkStatus: failed`.
+- Added compact checker-failure status publication from the Python `check-job` path.
+- Ensured target/checker failures produce `CheckFailed`, not `DriftDetected`.
+- Added tests for:
+  - checker Job lifecycle settings
+  - repair Job lifecycle settings
+  - timeout classification
+  - stable checker/repair Job names for the same check ID
+  - compact checker failure reports
+  - corrupt target documents detected as real stale drift
+
+Runtime-verified now:
+
+- Python unit tests: 40 passed.
+- Python compile check: passed.
+- Go/controller tests: passed.
+- YAML parsing for Compose, CRDs, example resources, and Kubernetes manifests: passed.
+- Local no-Docker proof: passed.
+- Go operator build: passed.
+- Docker Compose runtime proof:
+  - seeded 50 orders
+  - indexed 42 events and intentionally skipped 8 paid orders
+  - existence check reported `DriftDetected` with 8 missing counterexamples
+  - direct repair reindexed 8 missing orders
+  - strict post-repair existence check reported `Healthy` across 41 paid orders
+  - aggregate check reported `Healthy`
+  - checksum/Merkle check reported `Healthy`
+  - OpenSearch freshness check reported current `Healthy` and preserved 41 historical SLO breaches at `maxLagSeconds=0`
+  - Redis cache freshness check reported current `Healthy` and preserved 41 historical SLO breaches at `maxLagSeconds=0`
+  - ClickHouse analytics aggregate check reported `Healthy`
+  - MinIO/S3 report publication returned `s3://kubedataguard-reports/local/drift-*.json`
+  - MinIO bucket contained JSON, Markdown, compact JSON, and `latest.json`
+- Cleanup completed:
+  - Compose containers stopped
+  - Compose volumes removed
+  - generated Go operator binary removed
+  - Go build/test cache cleaned
+  - Docker dangling image/build leftovers pruned
+
 ## Next Actions
 
-1. Runtime-verify the new StatefulSet/Redis/ClickHouse stack end to end in kind.
-2. Expand failure taxonomy coverage:
-   - target unavailable
-   - checker timeout
-   - repair Job crash before report publication
-   - repair retry/idempotency
-   - stale/corrupt target document
-3. Runtime-verify `make demo-clickhouse-drift` with the analytics compose profile.
-4. Add managed lifecycle policy examples for S3/GCS outside the worker.
-5. Add OpenLineage event emission for check and repair reports.
+1. Runtime-verify the full operator path in kind:
+   - CRDs
+   - StatefulSet demo stack
+   - operator Deployment
+   - checker Jobs with deadlines
+   - repair Jobs with deadlines
+   - compact status ConfigMaps
+   - Secret/topology fan-out
+2. Add managed lifecycle policy examples for S3/GCS outside the worker.
+3. Add OpenLineage event emission for check and repair reports.
+4. Add a dedicated repair Job crash-before-report integration proof in kind.
+5. Decide whether to remove or keep locally cached Docker images after every full runtime proof.
 
 ## Open Questions
 
@@ -1399,6 +1452,8 @@ Current answer:
 - Secret-backed DataSource/DerivedView connection resolution is implemented for worker Jobs.
 - DataSource/DerivedView/Secret watch fan-out to dependent Invariants is implemented.
 - Compact reports, local retention, and S3 SSE knobs are implemented.
+- Job lifecycle/deadline controls are implemented.
+- Timeout/checker-failure classification is implemented.
 - Next blocking decisions: managed object-store lifecycle policies and production database-operator deployment choices.
 
 ### Next Sprint
@@ -1414,7 +1469,7 @@ Current answer:
 - Persisted scan checkpoints are implemented for bounded keyset scans.
 - Secret-backed `DataSource` and `DerivedView` resolution is implemented for the job-backed operator.
 - `DataSource` and `DerivedView` topology changes now enqueue affected `Invariant`s.
-- Next: runtime verification of the full Redis/ClickHouse StatefulSet stack, lifecycle policy examples, and OpenLineage emission.
+- Next: kind-level operator runtime verification, lifecycle policy examples, and OpenLineage emission.
 
 ### Future
 

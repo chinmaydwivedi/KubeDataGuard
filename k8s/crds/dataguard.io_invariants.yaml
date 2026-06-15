@@ -72,6 +72,16 @@ spec:
                   minimum: 1
                   maximum: 12
                   default: 1
+                jobActiveDeadlineSeconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 86400
+                  default: 300
+                jobTTLSecondsAfterFinished:
+                  type: integer
+                  minimum: 0
+                  maximum: 86400
+                  default: 600
                 compareFields:
                   type: array
                   items:

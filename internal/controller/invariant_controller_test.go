@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -160,6 +163,54 @@ func TestBuildCheckerJobUsesInvariantConfiguration(t *testing.T) {
 	}
 	if env["AWS_REGION"] != "us-west-2" {
 		t.Fatalf("AWS_REGION = %q", env["AWS_REGION"])
+	}
+}
+
+func TestBuildCheckerJobSetsLifecycleLimits(t *testing.T) {
+	invariant := invariantObject(
+		"paid-orders-indexed",
+		"existence",
+		map[string]string{
+			AnnotationJobActiveDeadline:   "45",
+			AnnotationJobTTLAfterFinished: "120",
+		},
+	)
+
+	job, err := BuildCheckerJob(invariant, CheckRun{ID: "g3"})
+	if err != nil {
+		t.Fatalf("BuildCheckerJob returned error: %v", err)
+	}
+
+	if *job.Spec.BackoffLimit != int32(0) {
+		t.Fatalf("BackoffLimit = %d, want 0", *job.Spec.BackoffLimit)
+	}
+	if *job.Spec.ActiveDeadlineSeconds != int64(45) {
+		t.Fatalf("ActiveDeadlineSeconds = %d, want 45", *job.Spec.ActiveDeadlineSeconds)
+	}
+	if *job.Spec.TTLSecondsAfterFinished != int32(120) {
+		t.Fatalf("TTLSecondsAfterFinished = %d, want 120", *job.Spec.TTLSecondsAfterFinished)
+	}
+}
+
+func TestBuildRepairJobUsesSpecLifecycleLimits(t *testing.T) {
+	invariant := invariantObject("paid-orders-indexed", "existence", nil)
+	spec := invariant.Object["spec"].(map[string]any)
+	spec["jobActiveDeadlineSeconds"] = int64(90)
+	spec["jobTTLSecondsAfterFinished"] = int64(30)
+
+	job, err := BuildRepairJob(invariant, "dataguard-report-paid-orders-indexed-g3", CheckRun{ID: "g3"})
+	if err != nil {
+		t.Fatalf("BuildRepairJob returned error: %v", err)
+	}
+
+	if *job.Spec.BackoffLimit != int32(0) {
+		t.Fatalf("BackoffLimit = %d, want 0", *job.Spec.BackoffLimit)
+	}
+	if *job.Spec.ActiveDeadlineSeconds != int64(90) {
+		t.Fatalf("ActiveDeadlineSeconds = %d, want 90", *job.Spec.ActiveDeadlineSeconds)
+	}
+	if *job.Spec.TTLSecondsAfterFinished != int32(30) {
+		t.Fatalf("TTLSecondsAfterFinished = %d, want 30", *job.Spec.TTLSecondsAfterFinished)
 	}
 }
 
@@ -619,6 +670,88 @@ func TestLifecycleFailureStatusesDistinguishCheckAndRepairFailure(t *testing.T) 
 	}
 	if repairFailed["reason"] != "verification still found drift" {
 		t.Fatalf("repair reason = %v", repairFailed["reason"])
+	}
+}
+
+func TestLifecycleFailureStatusesClassifyDeadlineExceededAsTimeout(t *testing.T) {
+	invariant := invariantObject("paid-orders-indexed", "existence", nil)
+	now := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
+	run := CheckRun{ID: "g3"}
+	job := &batchv1.Job{
+		Status: batchv1.JobStatus{
+			Conditions: []batchv1.JobCondition{
+				{
+					Type:               batchv1.JobFailed,
+					Status:             corev1.ConditionTrue,
+					LastTransitionTime: metav1.NewTime(now),
+					Reason:             "DeadlineExceeded",
+					Message:            "Job was active longer than activeDeadlineSeconds",
+				},
+			},
+		},
+	}
+
+	if !jobFailed(job) {
+		t.Fatal("jobFailed = false, want true")
+	}
+	if !jobTimedOut(job) {
+		t.Fatal("jobTimedOut = false, want true")
+	}
+
+	checkFailed := checkerFailureStatusForJob(
+		invariant,
+		now,
+		"check-job",
+		run,
+		job,
+		"checker job failed before publishing a valid status report",
+	)
+	if checkFailed["phase"] != PhaseCheckFailed {
+		t.Fatalf("check phase = %v, want %s", checkFailed["phase"], PhaseCheckFailed)
+	}
+	if checkFailed["checkStatus"] != CheckTimedOut {
+		t.Fatalf("checkStatus = %v, want %s", checkFailed["checkStatus"], CheckTimedOut)
+	}
+	if !strings.Contains(checkFailed["reason"].(string), "DeadlineExceeded") {
+		t.Fatalf("reason = %v, want DeadlineExceeded detail", checkFailed["reason"])
+	}
+
+	repairFailed := repairFailureStatusForJob(
+		invariant,
+		now,
+		"repair-job",
+		run,
+		4,
+		job,
+		"repair job failed before publishing a valid status report",
+	)
+	if repairFailed["phase"] != PhaseRepairFailed {
+		t.Fatalf("repair phase = %v, want %s", repairFailed["phase"], PhaseRepairFailed)
+	}
+	if repairFailed["checkStatus"] != CheckTimedOut {
+		t.Fatalf("repair checkStatus = %v, want %s", repairFailed["checkStatus"], CheckTimedOut)
+	}
+	if repairFailed["driftCount"] != int64(4) {
+		t.Fatalf("repair driftCount = %v, want 4", repairFailed["driftCount"])
+	}
+}
+
+func TestJobNamesAreStableForSameCheckID(t *testing.T) {
+	invariant := invariantObject("paid-orders-indexed", "existence", nil)
+
+	first := checkerJobName(invariant, "g3-t42")
+	second := checkerJobName(invariant, "g3-t42")
+	repairFirst := repairJobName(invariant, "g3-t42")
+	repairSecond := repairJobName(invariant, "g3-t42")
+
+	if first != second {
+		t.Fatalf("checker job name changed: %q != %q", first, second)
+	}
+	if repairFirst != repairSecond {
+		t.Fatalf("repair job name changed: %q != %q", repairFirst, repairSecond)
+	}
+	if first == repairFirst {
+		t.Fatalf("checker and repair jobs share a name: %q", first)
 	}
 }
 

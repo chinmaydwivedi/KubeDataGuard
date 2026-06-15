@@ -349,24 +349,47 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
     from .observability import write_observability_artifacts
     from .reporting import write_report_artifacts
 
-    report = check_invariant(
-        checker,
-        settings,
-        invariant=args.invariant,
-        max_lag_seconds=args.max_lag_seconds,
-        invariant_name=args.invariant_name,
-        source_query=args.source_query,
-        target_query=args.target_query,
-        key_field=args.key_field,
-        compare_fields=parse_compare_fields(args.compare_fields),
-        source_scan_page_size=args.source_scan_page_size,
-        source_resume_after_key=args.source_resume_after_key,
-        source_checkpoint_id=args.source_checkpoint_id,
-        source_reset_checkpoint=args.source_reset_checkpoint,
-        source_max_pages=args.source_max_pages,
-        checksum_prefix_length=args.checksum_prefix_length,
-        check_id=args.check_id,
-    )
+    namespace = args.namespace or namespace_from_service_account()
+    compare_fields = parse_compare_fields(args.compare_fields)
+
+    try:
+        report = check_invariant(
+            checker,
+            settings,
+            invariant=args.invariant,
+            max_lag_seconds=args.max_lag_seconds,
+            invariant_name=args.invariant_name,
+            source_query=args.source_query,
+            target_query=args.target_query,
+            key_field=args.key_field,
+            compare_fields=compare_fields,
+            source_scan_page_size=args.source_scan_page_size,
+            source_resume_after_key=args.source_resume_after_key,
+            source_checkpoint_id=args.source_checkpoint_id,
+            source_reset_checkpoint=args.source_reset_checkpoint,
+            source_max_pages=args.source_max_pages,
+            checksum_prefix_length=args.checksum_prefix_length,
+            check_id=args.check_id,
+        )
+    except Exception as exc:
+        payload, status = build_check_failed_job_result(
+            invariant_name=args.invariant_name,
+            invariant=args.invariant,
+            max_lag_seconds=args.max_lag_seconds,
+            observed_generation=args.observed_generation,
+            check_id=args.check_id,
+            reason=f"{exc.__class__.__name__}: {exc}",
+            compare_fields=compare_fields,
+        )
+        write_observability_artifacts(settings, payload, artifact_name=args.check_id or "check-failed")
+        publish_report_configmap(
+            namespace=namespace,
+            name=args.config_map,
+            report=payload,
+            status=status,
+        )
+        print(json.dumps({"configMap": args.config_map, "status": status}, indent=2, sort_keys=True))
+        return
 
     payload = report.to_dict()
     artifacts = write_report_artifacts(settings, report)
@@ -380,7 +403,6 @@ def run_check_job(settings: Settings, args: argparse.Namespace) -> None:
         payload["checkID"] = args.check_id
     write_observability_artifacts(settings, payload, artifact_name=args.check_id or "latest")
 
-    namespace = args.namespace or namespace_from_service_account()
     publish_report_configmap(
         namespace=namespace,
         name=args.config_map,
@@ -569,6 +591,83 @@ def check_invariant(
             check_id=check_id,
         )
     raise SystemExit(f"unknown invariant: {invariant}")
+
+
+def guarantee_for_invariant(invariant: str, compare_fields: list[str] | None = None) -> str:
+    if invariant == "aggregate":
+        return "aggregate"
+    if invariant == "checksum":
+        return "checksumMerkle"
+    if invariant == "freshness":
+        return "boundedFreshness"
+    if invariant == "redis-freshness":
+        return "boundedFreshness"
+    if invariant == "clickhouse-aggregate":
+        return "aggregate"
+    if invariant == "query":
+        return "existence+fieldEquality" if compare_fields else "existence"
+    return "existence+fieldEquality"
+
+
+def build_check_failed_job_result(
+    *,
+    invariant_name: str,
+    invariant: str,
+    max_lag_seconds: int,
+    observed_generation: int,
+    check_id: str,
+    reason: str,
+    compare_fields: list[str] | None = None,
+) -> tuple[dict, dict]:
+    checked_at = datetime.now(timezone.utc)
+    target_read_at = checked_at
+    eligible_before = checked_at - timedelta(seconds=max_lag_seconds)
+    guarantee = guarantee_for_invariant(invariant, compare_fields=compare_fields)
+    observation_window = {
+        "checked_at": checked_at.isoformat(),
+        "target_read_at": target_read_at.isoformat(),
+        "max_lag_seconds": max_lag_seconds,
+        "eligible_records_before": eligible_before.isoformat(),
+        "completeness": "failed",
+    }
+    status_observation_window = {
+        "checkedAt": observation_window["checked_at"],
+        "targetReadAt": observation_window["target_read_at"],
+        "maxLagSeconds": max_lag_seconds,
+        "eligibleRecordsBefore": observation_window["eligible_records_before"],
+        "completeness": "failed",
+    }
+    status = {
+        "healthy": False,
+        "phase": "CheckFailed",
+        "guarantee": guarantee,
+        "checkStatus": "failed",
+        "driftCount": 0,
+        "counterexampleCount": 1,
+        "checkedRecords": 0,
+        "lastCheckedAt": observation_window["checked_at"],
+        "observationWindow": status_observation_window,
+        "observedGeneration": observed_generation,
+        "reason": reason,
+    }
+    if check_id:
+        status["checkID"] = check_id
+    payload = {
+        "kind": "KubeDataGuardCheckFailureReport",
+        "invariant": invariant_name,
+        "status": "CheckFailed",
+        "healthy": False,
+        "guarantee": guarantee,
+        "check_status": "failed",
+        "drift_count": 0,
+        "checked_records": 0,
+        "counterexamples": [{"type": "checker_failure", "reason": reason}],
+        "observation_window": observation_window,
+        "kubernetes_status": status,
+    }
+    if check_id:
+        payload["checkID"] = check_id
+    return payload, status
 
 
 def update_scan_checkpoint_report_ref(settings: Settings, payload: dict, report_ref: str) -> None:

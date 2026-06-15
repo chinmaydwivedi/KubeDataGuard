@@ -41,9 +41,12 @@ const (
 	AnnotationReportS3SSE           = "dataguard.io/report-s3-sse"
 	AnnotationReportS3KMSKeyID      = "dataguard.io/report-s3-kms-key-id"
 	AnnotationAWSRegion             = "dataguard.io/aws-region"
+	AnnotationJobActiveDeadline     = "dataguard.io/job-active-deadline-seconds"
+	AnnotationJobTTLAfterFinished   = "dataguard.io/job-ttl-seconds-after-finished"
 
-	CheckPartial = "partial"
-	CheckFailed  = "failed"
+	CheckPartial  = "partial"
+	CheckFailed   = "failed"
+	CheckTimedOut = "timedOut"
 
 	PhaseUnknown     = "Unknown"
 	PhaseCheckFailed = "CheckFailed"
@@ -63,6 +66,8 @@ const (
 	DefaultKafkaSecretKey        = "bootstrapServers"
 	DefaultRedisSecretKey        = "url"
 	DefaultClickHouseSecretKey   = "url"
+	DefaultJobActiveDeadline     = int64(300)
+	DefaultJobTTLAfterFinished   = int64(600)
 )
 
 type CheckRun struct {
@@ -172,7 +177,7 @@ func (r *InvariantReconciler) reconcileJobBackedInvariant(
 	}
 
 	if jobFailed(job) {
-		status := BuildJobFailedStatus(invariant, r.clock().Now(), jobName, run, "checker job failed before publishing a valid status report")
+		status := checkerFailureStatusForJob(invariant, r.clock().Now(), jobName, run, job, "checker job failed before publishing a valid status report")
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -291,7 +296,7 @@ func (r *InvariantReconciler) reconcileRepairForDrift(
 	}
 
 	if jobFailed(job) {
-		status := BuildRepairFailedStatus(invariant, r.clock().Now(), jobName, run, driftCount, "repair job failed before publishing a valid status report")
+		status := repairFailureStatusForJob(invariant, r.clock().Now(), jobName, run, driftCount, job, "repair job failed before publishing a valid status report")
 		if err := r.patchInvariantStatus(ctx, invariant, status); err != nil {
 			return ctrl.Result{}, true, err
 		}
@@ -481,7 +486,8 @@ func BuildCheckerJobWithEnv(
 	configMapName := reportConfigMapName(invariant, run.ID)
 	serviceAccountName := checkerServiceAccountName(invariant)
 	backoffLimit := int32(0)
-	ttlSeconds := int32(600)
+	ttlSeconds := jobTTLSecondsAfterFinished(invariant)
+	activeDeadlineSeconds := jobActiveDeadlineSeconds(invariant)
 	args := []string{
 		"check-job",
 		"--invariant", checkerInvariantArg(invariant),
@@ -504,6 +510,7 @@ func BuildCheckerJobWithEnv(
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
 			TTLSecondsAfterFinished: &ttlSeconds,
+			ActiveDeadlineSeconds:   &activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: checkerLabels(invariant),
@@ -546,7 +553,8 @@ func BuildRepairJobWithEnv(
 	configMapName := repairConfigMapName(invariant, run.ID)
 	serviceAccountName := repairServiceAccountName(invariant)
 	backoffLimit := int32(0)
-	ttlSeconds := int32(600)
+	ttlSeconds := jobTTLSecondsAfterFinished(invariant)
+	activeDeadlineSeconds := jobActiveDeadlineSeconds(invariant)
 	args := []string{
 		"repair-job",
 		"--namespace", invariant.GetNamespace(),
@@ -571,6 +579,7 @@ func BuildRepairJobWithEnv(
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            &backoffLimit,
 			TTLSecondsAfterFinished: &ttlSeconds,
+			ActiveDeadlineSeconds:   &activeDeadlineSeconds,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: repairLabels(invariant),
@@ -616,6 +625,18 @@ func BuildJobFailedStatus(invariant *unstructured.Unstructured, now time.Time, j
 	})
 }
 
+func BuildJobTimedOutStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, run CheckRun, reason string) map[string]any {
+	return jobLifecycleStatus(invariant, now, run, map[string]any{
+		"healthy":             false,
+		"phase":               PhaseCheckFailed,
+		"checkStatus":         CheckTimedOut,
+		"driftCount":          int64(0),
+		"counterexampleCount": int64(1),
+		"reportRef":           fmt.Sprintf("job://%s/%s", invariant.GetNamespace(), jobName),
+		"reason":              reason,
+	})
+}
+
 func BuildRepairRunningStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, run CheckRun, driftCount int64) map[string]any {
 	return jobLifecycleStatus(invariant, now, run, map[string]any{
 		"healthy":             false,
@@ -632,6 +653,18 @@ func BuildRepairFailedStatus(invariant *unstructured.Unstructured, now time.Time
 		"healthy":             false,
 		"phase":               PhaseRepairFailed,
 		"checkStatus":         CheckFailed,
+		"driftCount":          driftCount,
+		"counterexampleCount": driftCount,
+		"reportRef":           fmt.Sprintf("job://%s/%s", invariant.GetNamespace(), jobName),
+		"reason":              reason,
+	})
+}
+
+func BuildRepairTimedOutStatus(invariant *unstructured.Unstructured, now time.Time, jobName string, run CheckRun, driftCount int64, reason string) map[string]any {
+	return jobLifecycleStatus(invariant, now, run, map[string]any{
+		"healthy":             false,
+		"phase":               PhaseRepairFailed,
+		"checkStatus":         CheckTimedOut,
 		"driftCount":          driftCount,
 		"counterexampleCount": driftCount,
 		"reportRef":           fmt.Sprintf("job://%s/%s", invariant.GetNamespace(), jobName),
@@ -1144,6 +1177,59 @@ func sourceMaxPages(invariant *unstructured.Unstructured) int64 {
 	return value
 }
 
+func jobActiveDeadlineSeconds(invariant *unstructured.Unstructured) int64 {
+	return boundedJobSeconds(
+		invariant,
+		"jobActiveDeadlineSeconds",
+		AnnotationJobActiveDeadline,
+		DefaultJobActiveDeadline,
+		1,
+		86400,
+	)
+}
+
+func jobTTLSecondsAfterFinished(invariant *unstructured.Unstructured) int32 {
+	value := boundedJobSeconds(
+		invariant,
+		"jobTTLSecondsAfterFinished",
+		AnnotationJobTTLAfterFinished,
+		DefaultJobTTLAfterFinished,
+		0,
+		86400,
+	)
+	return int32(value)
+}
+
+func boundedJobSeconds(
+	invariant *unstructured.Unstructured,
+	specField string,
+	annotation string,
+	fallback int64,
+	minValue int64,
+	maxValue int64,
+) int64 {
+	if value, found, _ := unstructured.NestedInt64(invariant.Object, "spec", specField); found {
+		return clampInt64(value, minValue, maxValue)
+	}
+	if raw := invariant.GetAnnotations()[annotation]; raw != "" {
+		value, err := strconv.ParseInt(raw, 10, 64)
+		if err == nil {
+			return clampInt64(value, minValue, maxValue)
+		}
+	}
+	return fallback
+}
+
+func clampInt64(value int64, minValue int64, maxValue int64) int64 {
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
 func currentCheckRun(invariant *unstructured.Unstructured, now time.Time) (CheckRun, error) {
 	intervalSeconds, found, err := unstructured.NestedInt64(invariant.Object, "spec", "checkIntervalSeconds")
 	if err != nil {
@@ -1271,4 +1357,61 @@ func jobFailed(job *batchv1.Job) bool {
 		}
 	}
 	return false
+}
+
+func jobTimedOut(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type == batchv1.JobFailed && condition.Status == corev1.ConditionTrue && condition.Reason == "DeadlineExceeded" {
+			return true
+		}
+	}
+	return false
+}
+
+func checkerFailureStatusForJob(
+	invariant *unstructured.Unstructured,
+	now time.Time,
+	jobName string,
+	run CheckRun,
+	job *batchv1.Job,
+	fallback string,
+) map[string]any {
+	reason := jobFailureExplanation(job, fallback)
+	if jobTimedOut(job) {
+		return BuildJobTimedOutStatus(invariant, now, jobName, run, reason)
+	}
+	return BuildJobFailedStatus(invariant, now, jobName, run, reason)
+}
+
+func repairFailureStatusForJob(
+	invariant *unstructured.Unstructured,
+	now time.Time,
+	jobName string,
+	run CheckRun,
+	driftCount int64,
+	job *batchv1.Job,
+	fallback string,
+) map[string]any {
+	reason := jobFailureExplanation(job, fallback)
+	if jobTimedOut(job) {
+		return BuildRepairTimedOutStatus(invariant, now, jobName, run, driftCount, reason)
+	}
+	return BuildRepairFailedStatus(invariant, now, jobName, run, driftCount, reason)
+}
+
+func jobFailureExplanation(job *batchv1.Job, fallback string) string {
+	for _, condition := range job.Status.Conditions {
+		if condition.Type != batchv1.JobFailed || condition.Status != corev1.ConditionTrue {
+			continue
+		}
+		parts := []string{fallback}
+		if condition.Reason != "" {
+			parts = append(parts, condition.Reason)
+		}
+		if condition.Message != "" {
+			parts = append(parts, condition.Message)
+		}
+		return strings.Join(parts, ": ")
+	}
+	return fallback
 }

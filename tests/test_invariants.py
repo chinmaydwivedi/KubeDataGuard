@@ -16,7 +16,7 @@ from dataguard.invariants import (
     compare_query_results,
     summarize_paid_orders,
 )
-from dataguard.cli import build_repair_job_result
+from dataguard.cli import build_check_failed_job_result, build_repair_job_result
 from dataguard.checker import build_cdc_frontier
 from dataguard.checkpoints import (
     load_scan_checkpoint,
@@ -136,6 +136,26 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
         self.assertEqual(status["reportRef"], "reports/latest.json")
         self.assertIn("checkedAt", status["observationWindow"])
         self.assertIn("maxLagSeconds", status["observationWindow"])
+
+    def test_check_failure_payload_is_not_reported_as_drift(self):
+        payload, status = build_check_failed_job_result(
+            invariant_name="paid-orders-indexed",
+            invariant="existence",
+            max_lag_seconds=60,
+            observed_generation=3,
+            check_id="g3-t1",
+            reason="ConnectionError: OpenSearch unavailable",
+            compare_fields=[],
+        )
+
+        self.assertEqual(status["phase"], "CheckFailed")
+        self.assertEqual(status["checkStatus"], "failed")
+        self.assertEqual(status["driftCount"], 0)
+        self.assertEqual(status["counterexampleCount"], 1)
+        self.assertEqual(status["checkID"], "g3-t1")
+        self.assertEqual(payload["status"], "CheckFailed")
+        self.assertEqual(payload["drift_count"], 0)
+        self.assertEqual(payload["counterexamples"][0]["type"], "checker_failure")
 
     def test_report_artifacts_include_compact_report_and_apply_retention(self):
         source = [
@@ -306,6 +326,39 @@ class PaidOrdersIndexedInvariantTests(unittest.TestCase):
             payload["kubernetes_status"]["observationWindow"]["checksumTree"]["drilldown"]["source_rows"],
             1,
         )
+
+    def test_checksum_reports_present_but_corrupt_target_document(self):
+        source_rows = [
+            {
+                "id": "order-1",
+                "status": "paid",
+                "amount_cents": 1200,
+                "currency": "USD",
+                "version": 4,
+                "updated_at": "2026-06-12T00:00:00+00:00",
+            },
+        ]
+        target_rows = [
+            {
+                **source_rows[0],
+                "amount_cents": 100,
+                "version": 3,
+                "indexed_at": "2026-06-12T00:00:05Z",
+            },
+        ]
+        report = compare_paid_order_checksum_buckets(
+            source_buckets=summarize_rows_by_prefix(source_rows, prefix_length=1),
+            target_buckets=summarize_rows_by_prefix(target_rows, prefix_length=1),
+            source_rows=source_rows,
+            target_rows=target_rows,
+            prefix_length=1,
+        )
+
+        self.assertFalse(report.healthy)
+        self.assertEqual(report.status, "DriftDetected")
+        self.assertEqual(report.stale[0]["order_id"], "order-1")
+        fields = {mismatch["field"] for mismatch in report.stale[0]["mismatches"]}
+        self.assertEqual(fields, {"amount_cents", "version"})
 
     def test_freshness_detects_missing_and_stale_derived_updates(self):
         source = [
